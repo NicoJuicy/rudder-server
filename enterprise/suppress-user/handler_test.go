@@ -7,13 +7,11 @@ import (
 	"testing"
 	"time"
 
-	"github.com/rudderlabs/rudder-server/utils/logger"
 	"github.com/stretchr/testify/require"
-)
 
-func init() {
-	rand.Seed(time.Now().UnixNano())
-}
+	"github.com/rudderlabs/rudder-go-kit/logger"
+	"github.com/rudderlabs/rudder-server/enterprise/suppress-user/model"
+)
 
 func TestIsSuppressedConcurrency(t *testing.T) {
 	log := &tLog{Logger: logger.NOP}
@@ -24,7 +22,7 @@ func TestIsSuppressedConcurrency(t *testing.T) {
 	for i := 0; i < 1000; i++ {
 		go func() {
 			defer wg.Done()
-			require.False(t, h.IsSuppressedUser("workspaceID", "userID", "sourceID"))
+			h.GetSuppressedUser("workspaceID", "userID", "sourceID")
 		}()
 	}
 	wg.Wait()
@@ -35,12 +33,12 @@ type fakeSuppresser struct {
 	Repository
 }
 
-func (*fakeSuppresser) Suppressed(_, _, _ string) (bool, error) {
+func (*fakeSuppresser) Suppressed(_, _, _ string) (*model.Metadata, error) {
 	// random failures, but always returning false
-	if rand.Intn(2)%2 == 0 { // skipcq: GSC-G404
-		return false, fmt.Errorf("some error")
+	if rand.New(rand.NewSource(time.Now().UnixNano())).Intn(2)%2 == 0 { // skipcq: GSC-G404
+		return nil, fmt.Errorf("some error")
 	} else {
-		return false, nil
+		return &model.Metadata{}, nil
 	}
 }
 
@@ -49,6 +47,6 @@ type tLog struct {
 	logger.Logger
 }
 
-func (t *tLog) Warn(_ ...interface{}) {
+func (t *tLog) Errorf(_ string, _ ...interface{}) {
 	t.times++
 }

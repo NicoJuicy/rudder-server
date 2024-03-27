@@ -1,7 +1,9 @@
 package stats
 
 import (
-	"github.com/rudderlabs/rudder-server/services/stats"
+	"github.com/samber/lo"
+
+	"github.com/rudderlabs/rudder-go-kit/stats"
 )
 
 type SourceStat struct {
@@ -11,6 +13,8 @@ type SourceStat struct {
 	ReqType     string
 	SourceID    string
 	WorkspaceID string
+	SourceType  string
+	Version     string
 
 	reason string
 
@@ -24,6 +28,7 @@ type SourceStat struct {
 	}
 	events struct {
 		total int
+		bot   int
 
 		succeeded int
 		failed    int
@@ -63,7 +68,7 @@ func (ss *SourceStat) RequestEventsSucceeded(num int) {
 	ss.requests.succeeded++
 }
 
-// RequestEventsSucceeded increments the requests total & failed counters by one, and the events total & failed counters by num
+// RequestEventsFailed increments the requests total & failed counters by one, and the events total & failed counters by num
 func (ss *SourceStat) RequestEventsFailed(num int, reason string) {
 	ss.requests.total++
 	ss.requests.failed++
@@ -72,27 +77,26 @@ func (ss *SourceStat) RequestEventsFailed(num int, reason string) {
 	ss.reason = reason
 }
 
-// Reports captured stats
+func (ss *SourceStat) RequestEventsBot(num int) {
+	ss.events.bot += num
+}
+
+// Report captured stats
 func (ss *SourceStat) Report(s stats.Stats) {
-	tags := map[string]string{
+	tags := stats.Tags{
 		"source":      ss.Source,
 		"writeKey":    ss.WriteKey,
 		"reqType":     ss.ReqType,
 		"workspaceId": ss.WorkspaceID,
 		"sourceID":    ss.SourceID,
+		"sourceType":  ss.SourceType,
+		"sdkVersion":  ss.Version,
 	}
 
-	failedTags := map[string]string{
-		"source":      ss.Source,
-		"writeKey":    ss.WriteKey,
-		"reqType":     ss.ReqType,
-		"workspaceId": ss.WorkspaceID,
-		"sourceID":    ss.SourceID,
-	}
+	failedTags := lo.Assign(tags)
 	if ss.reason != "" {
 		failedTags["reason"] = ss.reason
 	}
-
 	s.NewTaggedStat("gateway.write_key_requests", stats.CountType, tags).Count(ss.requests.total)
 	s.NewTaggedStat("gateway.write_key_successful_requests", stats.CountType, tags).Count(ss.requests.succeeded)
 	s.NewTaggedStat("gateway.write_key_failed_requests", stats.CountType, failedTags).Count(ss.requests.failed)
@@ -102,5 +106,9 @@ func (ss *SourceStat) Report(s stats.Stats) {
 		s.NewTaggedStat("gateway.write_key_events", stats.CountType, tags).Count(ss.events.total)
 		s.NewTaggedStat("gateway.write_key_successful_events", stats.CountType, tags).Count(ss.events.succeeded)
 		s.NewTaggedStat("gateway.write_key_failed_events", stats.CountType, failedTags).Count(ss.events.failed)
+
+		if ss.events.bot > 0 {
+			s.NewTaggedStat("gateway.write_key_bot_events", stats.CountType, tags).Count(ss.events.bot)
+		}
 	}
 }

@@ -18,21 +18,24 @@ import (
 	"testing"
 	"time"
 
-	"github.com/rudderlabs/rudder-server/config"
-	"github.com/rudderlabs/rudder-server/router/utils"
-	"github.com/rudderlabs/rudder-server/runner"
-	"github.com/rudderlabs/rudder-server/testhelper/health"
-
 	"github.com/ory/dockertest/v3"
-	"github.com/rudderlabs/rudder-server/testhelper"
-	"github.com/rudderlabs/rudder-server/testhelper/destination"
-	trand "github.com/rudderlabs/rudder-server/testhelper/rand"
-	"github.com/rudderlabs/rudder-server/testhelper/workspaceConfig"
-	"github.com/rudderlabs/rudder-server/utils/httputil"
-	"github.com/rudderlabs/rudder-server/utils/types/deployment"
+	"github.com/samber/lo"
 	"github.com/stretchr/testify/require"
 	"github.com/tidwall/gjson"
 	"golang.org/x/sync/errgroup"
+
+	"github.com/rudderlabs/rudder-go-kit/bytesize"
+	"github.com/rudderlabs/rudder-go-kit/config"
+	kithttputil "github.com/rudderlabs/rudder-go-kit/httputil"
+	kithelper "github.com/rudderlabs/rudder-go-kit/testhelper"
+	"github.com/rudderlabs/rudder-go-kit/testhelper/docker/resource/postgres"
+	trand "github.com/rudderlabs/rudder-go-kit/testhelper/rand"
+	"github.com/rudderlabs/rudder-server/router/utils"
+	"github.com/rudderlabs/rudder-server/runner"
+	"github.com/rudderlabs/rudder-server/testhelper/destination"
+	"github.com/rudderlabs/rudder-server/testhelper/health"
+	"github.com/rudderlabs/rudder-server/testhelper/workspaceConfig"
+	"github.com/rudderlabs/rudder-server/utils/types/deployment"
 )
 
 // TestEventOrderGuarantee tests that order delivery guarantees are honoured by the server
@@ -49,8 +52,10 @@ import (
 
 // After sending the jobs to the server, we verify that the destination has received the jobs in the
 // correct order. We also verify that the server has not sent any job twice.
+//
+// A second scenario verifies that when [eventOrderKeyThreshold] is enabled jobs are delivered out-of-order even if event ordering is enabled
 func TestEventOrderGuarantee(t *testing.T) {
-	eventOrderTest := func(useFairPickup bool) func(t *testing.T) {
+	eventOrderTest := func(eventOrderKeyThreshold bool) func(t *testing.T) {
 		return func(t *testing.T) {
 			// necessary until we move away from a singleton config
 			config.Reset()
@@ -74,11 +79,12 @@ func TestEventOrderGuarantee(t *testing.T) {
 			// this will create a number of jobs for a number of users
 			// and prescribe the sequence of status codes that the webhook will return for each one e.g. 500, 500, 200
 			spec := m.newTestSpec(users, jobsPerUser)
+			spec.eventOrderKeyThreshold = eventOrderKeyThreshold
 			spec.responseDelay = responseDelay
 
 			t.Logf("Starting docker services (postgres & transformer)")
 			var (
-				postgresContainer    *destination.PostgresResource
+				postgresContainer    *postgres.Resource
 				transformerContainer *destination.TransformerResource
 				gatewayPort          string
 			)
@@ -86,7 +92,7 @@ func TestEventOrderGuarantee(t *testing.T) {
 			require.NoError(t, err)
 			containersGroup, _ := errgroup.WithContext(ctx)
 			containersGroup.Go(func() (err error) {
-				postgresContainer, err = destination.SetupPostgres(pool, t)
+				postgresContainer, err = postgres.Setup(pool, t, postgres.WithShmSize(256*bytesize.MB))
 				return err
 			})
 			containersGroup.Go(func() (err error) {
@@ -104,7 +110,7 @@ func TestEventOrderGuarantee(t *testing.T) {
 			writeKey := trand.String(27)
 			workspaceID := trand.String(27)
 			destinationID := trand.String(27)
-			templateCtx := map[string]string{
+			templateCtx := map[string]any{
 				"webhookUrl":    webhook.Server.URL,
 				"writeKey":      writeKey,
 				"workspaceId":   workspaceID,
@@ -115,7 +121,7 @@ func TestEventOrderGuarantee(t *testing.T) {
 			config.Set("BackendConfig.configJSONPath", configJsonPath)
 
 			t.Logf("Starting rudder-server")
-			config.Set("DEPLOYMENT_TYPE", string(deployment.DedicatedType))
+			config.Set("DEPLOYMENT_TYPE", deployment.DedicatedType)
 			config.Set("recovery.storagePath", path.Join(t.TempDir(), "/recovery_data.json"))
 
 			config.Set("DB.port", postgresContainer.Port)
@@ -129,7 +135,11 @@ func TestEventOrderGuarantee(t *testing.T) {
 			config.Set("JobsDB.backup.enabled", false)
 			config.Set("Router.jobIterator.maxQueries", 100)
 			config.Set("Router.jobIterator.discardedPercentageTolerance", 0)
-			config.Set("JobsDB.fairPickup", useFairPickup)
+			if eventOrderKeyThreshold {
+				config.Set("Router.eventOrderKeyThreshold", 1)
+			} else {
+				config.Set("Router.eventOrderKeyThreshold", 0)
+			}
 
 			// generatorLoop
 			config.Set("Router.jobQueryBatchSize", 500)
@@ -145,10 +155,8 @@ func TestEventOrderGuarantee(t *testing.T) {
 			config.Set("Router.updateStatusBatchSize", 100)
 			config.Set("Router.maxStatusUpdateWait", "10ms")
 
-			defer config.Reset()
-
 			// find free port for gateway http server to listen on
-			httpPortInt, err := testhelper.GetFreePort()
+			httpPortInt, err := kithelper.GetFreePort()
 			require.NoError(t, err)
 			gatewayPort = strconv.Itoa(httpPortInt)
 
@@ -235,7 +243,7 @@ func TestEventOrderGuarantee(t *testing.T) {
 					resp, err := client.Do(req)
 					require.NoError(t, err, "should be able to send the request to gateway")
 					require.Equal(t, http.StatusOK, resp.StatusCode, "should be able to send the request to gateway successfully", payload)
-					func() { httputil.CloseResponse(resp) }()
+					func() { kithttputil.CloseResponse(resp) }()
 				}
 			}()
 
@@ -258,16 +266,23 @@ func TestEventOrderGuarantee(t *testing.T) {
 					t.Logf("%d/%d done (%d drained)", done, total, drained)
 				}
 				return done == total
-			}, 300*time.Second, 2*time.Second, "webhook should receive all events and process them till the end")
+			}, 120*time.Second, 2*time.Second, "webhook should receive all events and process them till the end")
 
 			require.False(t, t.Failed(), "webhook shouldn't have failed")
 
-			for userID, jobs := range spec.doneOrdered {
-				var previousJobID int
-				for _, jobID := range jobs {
-					require.Greater(t, jobID, previousJobID, "%s: jobID %d should be greater than previous jobID %d", userID, jobID, previousJobID)
-					previousJobID = jobID
+			if !eventOrderKeyThreshold {
+				for userID, jobs := range spec.doneOrdered {
+					var previousJobID int
+					for _, jobID := range jobs {
+						require.Greater(t, jobID, previousJobID, "%s: jobID %d should be greater than previous jobID %d", userID, jobID, previousJobID)
+						previousJobID = jobID
+					}
 				}
+			} else {
+				unsorted := lo.Filter(lo.Values(spec.doneOrdered), func(jobs []int, _ int) bool {
+					return !lo.IsSorted(jobs)
+				})
+				require.Greater(t, len(unsorted), 0, "some jobs should be received out-of-order even if event ordering is enabled due to eventOrderKeyThreshold > 0")
 			}
 
 			t.Logf("All jobs arrived in expected order - test passed!")
@@ -277,17 +292,17 @@ func TestEventOrderGuarantee(t *testing.T) {
 		}
 	}
 
-	t.Run("fair pickup", eventOrderTest(true))
-	t.Run("legacy pickup", eventOrderTest(false))
+	t.Run("pickup with eventOrderKeyThreshold disabled", eventOrderTest(false))
+
+	t.Run("pickup with eventOrderKeyThreshold enabled", eventOrderTest(true))
 }
 
 // Using a struct to keep main_test package clean and
-// avoid method collisions with other tests
+// avoid function collisions with other tests
 // TODO: Move server's Run() out of main package
 type eventOrderMethods struct{}
 
 func (m eventOrderMethods) newTestSpec(users, jobsPerUser int) *eventOrderSpec {
-	rand.Seed(time.Now().UnixNano())
 	var s eventOrderSpec
 	s.jobsOrdered = make([]*eventOrderJobSpec, jobsPerUser*users)
 	s.jobs = map[int]*eventOrderJobSpec{}
@@ -323,12 +338,13 @@ func (m eventOrderMethods) newTestSpec(users, jobsPerUser int) *eventOrderSpec {
 
 func (eventOrderMethods) randomStatus() (status int, terminal bool) {
 	// playing with probabilities: 50% HTTP 500, 40% HTTP 200, 10% HTTP 400
+	newRand := rand.New(rand.NewSource(time.Now().UnixNano())) // skipcq: GSC-G404
 	statuses := []int{
 		http.StatusBadRequest, http.StatusBadRequest, http.StatusBadRequest, http.StatusBadRequest,
 		http.StatusOK, http.StatusOK, http.StatusOK, http.StatusOK,
 		http.StatusInternalServerError,
 	}
-	status = statuses[rand.Intn(len(statuses))] // skipcq: GSC-G404
+	status = statuses[newRand.Intn(len(statuses))] // skipcq: GSC-G404
 	terminal = status != http.StatusInternalServerError
 	return status, terminal
 }
@@ -338,6 +354,7 @@ func (eventOrderMethods) newWebhook(t *testing.T, spec *eventOrderSpec) *eventOr
 	wh.spec = spec
 
 	wh.Server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		newRand := rand.New(rand.NewSource(time.Now().UnixNano())) // skipcq: GSC-G404
 		body, err := io.ReadAll(r.Body)
 		require.NoError(t, err, "should be able to read the request body")
 		testJobId := gjson.GetBytes(body, "testJobId")
@@ -369,16 +386,18 @@ func (eventOrderMethods) newWebhook(t *testing.T, spec *eventOrderSpec) *eventOr
 			if len(wh.spec.doneOrdered[userID]) > 0 {
 				lastDoneId = wh.spec.doneOrdered[userID][len(wh.spec.doneOrdered[userID])-1]
 			}
-			require.Greater(t, jobID, lastDoneId, "received out-of-order event for user %s: job %d after jobs %+v", userID, jobID, wh.spec.doneOrdered[userID])
+			if !wh.spec.eventOrderKeyThreshold {
+				require.Greater(t, jobID, lastDoneId, "received out-of-order event for user %s: job %d after jobs %+v", userID, jobID, wh.spec.doneOrdered[userID])
+			}
 			wh.spec.done[jobID] = struct{}{}
 			wh.spec.doneOrdered[userID] = append(wh.spec.doneOrdered[userID], jobID)
 			// t.Logf("job %d done", jobID)
 		}
 		if spec.responseDelay > 0 {
-			time.Sleep(time.Duration(rand.Intn(int(spec.responseDelay.Milliseconds()))) * time.Millisecond) // skipcq: GSC-G404
+			time.Sleep(time.Duration(newRand.Intn(int(spec.responseDelay.Milliseconds()))) * time.Millisecond) // skipcq: GSC-G404
 		}
 		w.WriteHeader(responseCode)
-		_, err = w.Write([]byte(fmt.Sprintf("%d", responseCode)))
+		_, err = fmt.Fprintf(w, "%d", responseCode)
 		require.NoError(t, err, "should be able to write the response code to the response")
 	}))
 	return &wh
@@ -439,10 +458,14 @@ func (eventOrderMethods) countDrainedJobs(db *sql.DB) int {
 				tables = append(tables, table)
 			}
 		}
+		if err = rows.Err(); err != nil {
+			panic(err)
+		}
 	}
+
 	for _, table := range tables {
 		var dsCount int
-		_ = db.QueryRow(fmt.Sprintf(`SELECT COUNT(*) FROM %s WHERE error_code = '%s'`, table, strconv.Itoa(utils.DRAIN_ERROR_CODE))).Scan(&count)
+		_ = db.QueryRow(`SELECT COUNT(*) FROM `+table+` WHERE error_code = $1`, utils.DRAIN_ERROR_CODE).Scan(&count)
 		count += dsCount
 	}
 	return count
@@ -455,12 +478,13 @@ type eventOrderWebhook struct {
 }
 
 type eventOrderSpec struct {
-	jobs          map[int]*eventOrderJobSpec
-	jobsOrdered   []*eventOrderJobSpec
-	received      map[int]int
-	responseDelay time.Duration
-	done          map[int]struct{}
-	doneOrdered   map[string][]int
+	eventOrderKeyThreshold bool
+	jobs                   map[int]*eventOrderJobSpec
+	jobsOrdered            []*eventOrderJobSpec
+	received               map[int]int
+	responseDelay          time.Duration
+	done                   map[int]struct{}
+	doneOrdered            map[string][]int
 }
 
 type eventOrderJobSpec struct {

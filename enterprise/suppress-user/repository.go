@@ -3,10 +3,11 @@ package suppression
 import (
 	"io"
 
+	"github.com/rudderlabs/rudder-go-kit/logger"
+	"github.com/rudderlabs/rudder-go-kit/stats"
 	"github.com/rudderlabs/rudder-server/enterprise/suppress-user/internal/badgerdb"
 	"github.com/rudderlabs/rudder-server/enterprise/suppress-user/internal/memory"
 	"github.com/rudderlabs/rudder-server/enterprise/suppress-user/model"
-	"github.com/rudderlabs/rudder-server/utils/logger"
 )
 
 // Repository provides a generic interface for managing user suppressions
@@ -21,7 +22,7 @@ type Repository interface {
 	Add(suppressions []model.Suppression, token []byte) error
 
 	// Suppressed returns true if the given user is suppressed, false otherwise
-	Suppressed(workspaceID, userID, sourceID string) (bool, error)
+	Suppressed(workspaceID, userID, sourceID string) (*model.Metadata, error)
 
 	// Backup writes a backup of the repository to the given writer
 	Backup(w io.Writer) error
@@ -42,5 +43,5 @@ var (
 
 // NewBadgerRepository returns a new repository backed by badgerDB.
 func NewBadgerRepository(path string, log logger.Logger, opts ...badgerdb.Opt) (Repository, error) {
-	return badgerdb.NewRepository(path, log, opts...)
+	return badgerdb.NewRepository(path, log, stats.Default, opts...)
 }

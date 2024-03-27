@@ -4,95 +4,121 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
 	"time"
 
-	"github.com/cenkalti/backoff"
-	"github.com/rudderlabs/rudder-server/config"
-	"github.com/rudderlabs/rudder-server/services/filemanager"
-	fileuploader "github.com/rudderlabs/rudder-server/services/fileuploader"
-	"github.com/rudderlabs/rudder-server/services/stats"
-	"github.com/rudderlabs/rudder-server/utils/misc"
 	"golang.org/x/sync/errgroup"
+
+	"github.com/cenkalti/backoff"
+
+	"github.com/rudderlabs/rudder-go-kit/filemanager"
+	"github.com/rudderlabs/rudder-go-kit/stats"
+	"github.com/rudderlabs/rudder-server/services/fileuploader"
+	"github.com/rudderlabs/rudder-server/utils/misc"
+	. "github.com/rudderlabs/rudder-server/utils/tx" //nolint:staticcheck
 )
 
-// backupSettings is for capturing the backup
-// configuration from the config/env files to
-// instantiate jobdb correctly
-type backupSettings struct {
-	instanceBackupEnabled bool
-	FailedOnly            bool
-	PathPrefix            string
+func (jd *Handle) isBackupEnabled() bool {
+	return jd.conf.backup.masterBackupEnabled.Load() && jd.conf.backup.instanceBackupEnabled.Load()
 }
 
-func (b *backupSettings) isBackupEnabled() bool {
-	return masterBackupEnabled && b.instanceBackupEnabled
+func (jd *Handle) IsMasterBackupEnabled() bool {
+	return jd.conf.backup.masterBackupEnabled.Load()
 }
 
-func IsMasterBackupEnabled() bool {
-	return masterBackupEnabled
-}
-
-func (jd *HandleT) backupDSLoop(ctx context.Context) {
+func (jd *Handle) backupDSLoop(ctx context.Context) {
 	sleepMultiplier := time.Duration(1)
 
-	jd.logger.Info("BackupDS loop is running")
+	jd.logger.Info("backupDSLoop is running")
 
 	for {
 		select {
-		case <-time.After(sleepMultiplier * backupCheckSleepDuration):
-			if !jd.BackupSettings.isBackupEnabled() {
+		case <-time.After(sleepMultiplier * jd.conf.backup.backupCheckSleepDuration.Load()):
+			if !jd.isBackupEnabled() {
 				jd.logger.Debugf("backupDSLoop backup disabled %s", jd.tablePrefix)
 				continue
 			}
 		case <-ctx.Done():
 			return
 		}
-		jd.logger.Debugf("backupDSLoop backup enabled %s", jd.tablePrefix)
-		backupDSRange := jd.getBackupDSRange()
-		// check if non-empty dataset is present to back up
-		// else continue
-		sleepMultiplier = 1
-		if (dataSetRangeT{} == *backupDSRange) {
-			// sleep for more duration if no dataset is found
-			sleepMultiplier = 6
-			continue
+		loop := func() error {
+			jd.logger.Debugf("backupDSLoop backup enabled %s", jd.tablePrefix)
+			backupDSRange, err := jd.getBackupDSRange(ctx)
+			if err != nil {
+				return fmt.Errorf("[JobsDB] :: Failed to get backup dataset range. Err: %w", err)
+			}
+			// check if non-empty dataset is present to back up
+			// else continue
+			sleepMultiplier = 1
+			if (dataSetRangeT{} == *backupDSRange) {
+				// sleep for more duration if no dataset is found
+				sleepMultiplier = 6
+				return nil
+			}
+
+			backupDS := backupDSRange.ds
+
+			opPayload, err := json.Marshal(&backupDS)
+			jd.assertError(err)
+
+			if err := jd.WithTx(func(tx *Tx) error {
+				opID, err := jd.JournalMarkStartInTx(tx, backupDSOperation, opPayload)
+				if err != nil {
+					return fmt.Errorf("mark start of backup operation: %w", err)
+				}
+				if err := jd.backupDS(ctx, backupDSRange); err != nil {
+					return fmt.Errorf("backup dataset: %w", err)
+				}
+				if err := jd.journalMarkDoneInTx(tx, opID); err != nil {
+					return fmt.Errorf("mark end of backup operation: %w", err)
+				}
+				return nil
+			}); err != nil {
+				return err
+			}
+
+			return jd.WithTx(func(tx *Tx) error {
+				// drop dataset after successfully uploading both jobs and jobs_status to s3
+				opID, err := jd.JournalMarkStartInTx(tx, backupDropDSOperation, opPayload)
+				if err != nil {
+					return fmt.Errorf("mark start of drop backup operation: %w", err)
+				}
+				// Currently, we retry uploading a table for some time & if it fails. We only drop that table & not all `pre_drop` tables.
+				// So, in situation when new table creation rate is more than drop. We will still have pipe up issue.
+				// An easy way to fix this is, if at any point of time exponential retry fails then instead of just dropping that particular
+				// table drop all subsequent `pre_drop` table. As, most likely the upload of rest of the table will also fail with the same error.
+				if err := jd.dropDSInTx(tx, backupDS); err != nil {
+					return fmt.Errorf(" drop dataset: %w", err)
+				}
+				if err := jd.journalMarkDoneInTx(tx, opID); err != nil {
+					return fmt.Errorf("mark end of drop backup operation: %w", err)
+				}
+				return nil
+			})
+		}
+		if err := loop(); err != nil && ctx.Err() == nil {
+			if !jd.conf.skipMaintenanceError {
+				panic(err)
+			}
+			jd.logger.Errorw("failed to backup dataset", "error", err.Error())
 		}
 
-		backupDS := backupDSRange.ds
-
-		opPayload, err := json.Marshal(&backupDS)
-		jd.assertError(err)
-
-		opID := jd.JournalMarkStart(backupDSOperation, opPayload)
-		err = jd.backupDS(ctx, backupDSRange)
-		if err != nil {
-			jd.logger.Errorf("[JobsDB] :: Failed to backup jobs table %v. Err: %v", backupDSRange.ds.JobStatusTable, err)
-		}
-		jd.JournalMarkDone(opID)
-
-		// drop dataset after successfully uploading both jobs and jobs_status to s3
-		opID = jd.JournalMarkStart(backupDropDSOperation, opPayload)
-		// Currently, we retry uploading a table for some time & if it fails. We only drop that table & not all `pre_drop` tables.
-		// So, in situation when new table creation rate is more than drop. We will still have pipe up issue.
-		// An easy way to fix this is, if at any point of time exponential retry fails then instead of just dropping that particular
-		// table drop all subsequent `pre_drop` table. As, most likely the upload of rest of the table will also fail with the same error.
-		jd.mustDropDS(backupDS)
-		jd.JournalMarkDone(opID)
 	}
 }
 
 // backupDS writes both jobs and job_staus table to JOBS_BACKUP_STORAGE_PROVIDER
-func (jd *HandleT) backupDS(ctx context.Context, backupDSRange *dataSetRangeT) error {
+func (jd *Handle) backupDS(ctx context.Context, backupDSRange *dataSetRangeT) error {
 	if err := jd.WithTx(func(tx *Tx) error {
-		return jd.cleanStatusTable(ctx, tx, backupDSRange.ds.JobStatusTable)
+		_, err := jd.cleanStatusTable(ctx, tx, backupDSRange.ds.JobStatusTable, false)
+		return err
 	}); err != nil {
 		return fmt.Errorf("error while cleaning status table: %w", err)
 	}
-	if jd.BackupSettings.FailedOnly {
+	if jd.conf.backup.FailedOnly {
 		if err := jd.failedOnlyBackup(ctx, backupDSRange); err != nil {
 			return fmt.Errorf("error while backing up failed jobs: %w", err)
 		}
@@ -104,36 +130,56 @@ func (jd *HandleT) backupDS(ctx context.Context, backupDSRange *dataSetRangeT) e
 	return nil
 }
 
-func (jd *HandleT) uploadDumps(ctx context.Context, dumps map[string]string) error {
+func (jd *Handle) uploadDumps(ctx context.Context, dumps map[string]string) error {
 	g, ctx := errgroup.WithContext(ctx)
-	g.SetLimit(config.GetInt("JobsDB.JobsBackupUploadWorkers", 100))
+	g.SetLimit(jd.config.GetInt("JobsDB.JobsBackupUploadWorkers", 100))
 	for workspaceID, filePath := range dumps {
 		wrkId := workspaceID
 		path := filePath
-		g.Go(misc.WithBugsnag(func() error {
+		operation := func() error {
 			if err := jd.uploadTableDump(ctx, wrkId, path); err != nil {
-				jd.logger.Errorf("[JobsDB] :: Failed to upload workspaceId %v. Error: %s", wrkId, err.Error())
-				stats.Default.NewTaggedStat("backup_ds_failed", stats.CountType, stats.Tags{"customVal": jd.tablePrefix, "workspaceId": wrkId}).Increment()
+				jd.logger.Errorw(
+					"failed to upload jobs",
+					"workspaceId", wrkId,
+					"error", err.Error(),
+				)
+				stats.Default.NewTaggedStat(
+					"backup_ds_failed",
+					stats.CountType,
+					stats.Tags{
+						"customVal":   jd.tablePrefix,
+						"workspaceId": wrkId,
+					},
+				).Increment()
 				return err
 			}
 			return nil
+		}
+		g.Go(misc.WithBugsnag(func() error {
+			return backoff.RetryNotify(operation, backoff.WithMaxRetries(backoff.NewExponentialBackOff(), uint64(jd.config.GetInt("JobsDB.backup.maxRetries", 100))), func(err error, d time.Duration) {
+				jd.logger.Errorw(
+					"retrying uploading backup file",
+					"workspaceId", wrkId,
+					"error", err.Error(),
+				)
+			})
 		}))
 	}
 	return g.Wait()
 }
 
-func (jd *HandleT) failedOnlyBackup(ctx context.Context, backupDSRange *dataSetRangeT) error {
+func (jd *Handle) failedOnlyBackup(ctx context.Context, backupDSRange *dataSetRangeT) error {
 	tableName := backupDSRange.ds.JobStatusTable
 
-	getRowCount := func() (totalCount int64, err error) {
+	getRowCount := func(ctx context.Context) (totalCount int64, err error) {
 		countStmt := fmt.Sprintf(`SELECT COUNT(*) from %q where job_state in ('%s', '%s')`, tableName, Failed.State, Aborted.State)
-		if err = jd.dbHandle.QueryRow(countStmt).Scan(&totalCount); err != nil {
+		if err = jd.dbHandle.QueryRowContext(ctx, countStmt).Scan(&totalCount); err != nil {
 			return 0, fmt.Errorf("error while getting row count: %w", err)
 		}
 		return totalCount, nil
 	}
 
-	totalCount, err := getRowCount()
+	totalCount, err := getRowCount(ctx)
 	if err != nil {
 		return err
 	}
@@ -142,7 +188,7 @@ func (jd *HandleT) failedOnlyBackup(ctx context.Context, backupDSRange *dataSetR
 		return nil
 	}
 
-	jd.logger.Infof("[JobsDB] :: Backing up table (failed only backup): %v", tableName)
+	jd.logger.Infow("backing up table (failed only backup)", "tableName", tableName)
 
 	start := time.Now()
 	getFileName := func(workspaceID string) (string, error) {
@@ -151,11 +197,11 @@ func (jd *HandleT) failedOnlyBackup(ctx context.Context, backupDSRange *dataSetR
 		if err != nil {
 			return "", err
 		}
-		pathPrefix = strings.TrimPrefix(tableName, preDropTablePrefix)
+		pathPrefix := strings.TrimPrefix(tableName, preDropTablePrefix)
 		return fmt.Sprintf(`%v%v_%v.%v.gz`, tmpDirPath+backupPathDirName, pathPrefix, Aborted.State, workspaceID), nil
 	}
 
-	dumps, err := jd.createTableDumps(getFailedOnlyBackupQueryFn(backupDSRange), getFileName, totalCount)
+	dumps, err := jd.createTableDumps(ctx, getFailedOnlyBackupQueryFn(backupDSRange, jd.conf.backup.backupRowsBatchSize.Load(), jd.conf.backup.backupMaxTotalPayloadSize.Load()), getFileName, totalCount)
 	if err != nil {
 		return fmt.Errorf("error while creating table dump: %w", err)
 	}
@@ -166,24 +212,33 @@ func (jd *HandleT) failedOnlyBackup(ctx context.Context, backupDSRange *dataSetR
 	}()
 	err = jd.uploadDumps(ctx, dumps)
 	if err != nil {
-		return fmt.Errorf("error while uploading dumps for table: %s: %w", tableName, err)
+		jd.logger.Errorw(
+			"failed to upload failedOnly jobs backup",
+			"tableName", tableName,
+			"error", err.Error(),
+		)
+		return nil
 	}
-	stats.Default.NewTaggedStat("total_TableDump_TimeStat", stats.TimerType, stats.Tags{"customVal": jd.tablePrefix}).Since(start)
+	stats.Default.NewTaggedStat(
+		"total_TableDump_TimeStat",
+		stats.TimerType,
+		stats.Tags{"customVal": jd.tablePrefix},
+	).Since(start)
 	return nil
 }
 
-func (jd *HandleT) backupJobsTable(ctx context.Context, backupDSRange *dataSetRangeT) error {
+func (jd *Handle) backupJobsTable(ctx context.Context, backupDSRange *dataSetRangeT) error {
 	tableName := backupDSRange.ds.JobTable
 
-	getRowCount := func() (totalCount int64, err error) {
+	getRowCount := func(ctx context.Context) (totalCount int64, err error) {
 		countStmt := fmt.Sprintf(`SELECT COUNT(*) from %q`, tableName)
-		if err = jd.dbHandle.QueryRow(countStmt).Scan(&totalCount); err != nil {
+		if err = jd.dbHandle.QueryRowContext(ctx, countStmt).Scan(&totalCount); err != nil {
 			return 0, fmt.Errorf("error while getting row count: %w", err)
 		}
 		return totalCount, nil
 	}
 
-	totalCount, err := getRowCount()
+	totalCount, err := getRowCount(ctx)
 	if err != nil {
 		return err
 	}
@@ -192,7 +247,7 @@ func (jd *HandleT) backupJobsTable(ctx context.Context, backupDSRange *dataSetRa
 		return nil
 	}
 
-	jd.logger.Infof("[JobsDB] :: Backing up table (jobs table): %v", tableName)
+	jd.logger.Infow("backing up table (jobs table)", "tableName", tableName)
 
 	start := time.Now()
 
@@ -202,7 +257,7 @@ func (jd *HandleT) backupJobsTable(ctx context.Context, backupDSRange *dataSetRa
 		if err != nil {
 			return "", err
 		}
-		pathPrefix = strings.TrimPrefix(tableName, preDropTablePrefix)
+		pathPrefix := strings.TrimPrefix(tableName, preDropTablePrefix)
 		return fmt.Sprintf(`%v%v.%v.%v.%v.%v.%v.gz`,
 			tmpDirPath+backupPathDirName,
 			pathPrefix,
@@ -214,7 +269,7 @@ func (jd *HandleT) backupJobsTable(ctx context.Context, backupDSRange *dataSetRa
 		), nil
 	}
 
-	dumps, err := jd.createTableDumps(getJobsBackupQueryFn(backupDSRange), getFileName, totalCount)
+	dumps, err := jd.createTableDumps(ctx, getJobsBackupQueryFn(backupDSRange, jd.conf.backup.backupRowsBatchSize.Load(), jd.conf.backup.backupMaxTotalPayloadSize.Load()), getFileName, totalCount)
 	if err != nil {
 		return fmt.Errorf("error while creating table dump: %w", err)
 	}
@@ -225,7 +280,12 @@ func (jd *HandleT) backupJobsTable(ctx context.Context, backupDSRange *dataSetRa
 	}()
 	err = jd.uploadDumps(ctx, dumps)
 	if err != nil {
-		return fmt.Errorf("error while uploading dumps for table: %s: %w", tableName, err)
+		jd.logger.Errorw(
+			"failed to upload jobs backup",
+			"tableName", tableName,
+			"error", err,
+		)
+		return nil
 	}
 
 	// Do not record stat in error case as error case time might be low and skew stats
@@ -233,18 +293,18 @@ func (jd *HandleT) backupJobsTable(ctx context.Context, backupDSRange *dataSetRa
 	return nil
 }
 
-func (jd *HandleT) backupStatusTable(ctx context.Context, backupDSRange *dataSetRangeT) error {
+func (jd *Handle) backupStatusTable(ctx context.Context, backupDSRange *dataSetRangeT) error {
 	tableName := backupDSRange.ds.JobStatusTable
 
-	getRowCount := func() (totalCount int64, err error) {
+	getRowCount := func(ctx context.Context) (totalCount int64, err error) {
 		countStmt := fmt.Sprintf(`SELECT COUNT(*) from %q`, tableName)
-		if err = jd.dbHandle.QueryRow(countStmt).Scan(&totalCount); err != nil {
+		if err = jd.dbHandle.QueryRowContext(ctx, countStmt).Scan(&totalCount); err != nil {
 			return 0, fmt.Errorf("error while getting row count: %w", err)
 		}
 		return totalCount, nil
 	}
 
-	totalCount, err := getRowCount()
+	totalCount, err := getRowCount(ctx)
 	if err != nil {
 		return err
 	}
@@ -253,7 +313,7 @@ func (jd *HandleT) backupStatusTable(ctx context.Context, backupDSRange *dataSet
 		return nil
 	}
 
-	jd.logger.Infof("[JobsDB] :: Backing up table (status table): %v", tableName)
+	jd.logger.Infow("backing up table (status table)", "tableName", tableName)
 
 	start := time.Now()
 
@@ -263,11 +323,11 @@ func (jd *HandleT) backupStatusTable(ctx context.Context, backupDSRange *dataSet
 		if err != nil {
 			return "", err
 		}
-		pathPrefix = strings.TrimPrefix(tableName, preDropTablePrefix)
+		pathPrefix := strings.TrimPrefix(tableName, preDropTablePrefix)
 		return fmt.Sprintf(`%v%v.%v.gz`, tmpDirPath+backupPathDirName, pathPrefix, workspaceID), nil
 	}
 
-	dumps, err := jd.createTableDumps(getStatusBackupQueryFn(backupDSRange), getFileName, totalCount)
+	dumps, err := jd.createTableDumps(ctx, getStatusBackupQueryFn(backupDSRange, jd.conf.backup.backupRowsBatchSize.Load()), getFileName, totalCount)
 	if err != nil {
 		return fmt.Errorf("error while creating table dump: %w", err)
 	}
@@ -278,7 +338,12 @@ func (jd *HandleT) backupStatusTable(ctx context.Context, backupDSRange *dataSet
 	}()
 	err = jd.uploadDumps(ctx, dumps)
 	if err != nil {
-		return fmt.Errorf("error while uploading dumps for table: %s: %w", tableName, err)
+		jd.logger.Errorw(
+			"failed to upload jobStatus backup",
+			"tableName", tableName,
+			"error", err.Error(),
+		)
+		return nil
 	}
 
 	// Do not record stat in error case as error case time might be low and skew stats
@@ -286,7 +351,7 @@ func (jd *HandleT) backupStatusTable(ctx context.Context, backupDSRange *dataSet
 	return nil
 }
 
-func (jd *HandleT) completeBackup(ctx context.Context, backupDSRange *dataSetRangeT) error {
+func (jd *Handle) completeBackup(ctx context.Context, backupDSRange *dataSetRangeT) error {
 	if err := jd.backupJobsTable(ctx, backupDSRange); err != nil {
 		return err
 	}
@@ -296,7 +361,7 @@ func (jd *HandleT) completeBackup(ctx context.Context, backupDSRange *dataSetRan
 	return nil
 }
 
-func (jd *HandleT) removeTableJSONDumps() {
+func (jd *Handle) removeTableJSONDumps() {
 	backupPathDirName := "/rudder-s3-dumps/"
 	tmpDirPath, err := misc.CreateTMPDIR()
 	jd.assertError(err)
@@ -308,7 +373,7 @@ func (jd *HandleT) removeTableJSONDumps() {
 	}
 }
 
-func getFailedOnlyBackupQueryFn(backupDSRange *dataSetRangeT) func(int64) string {
+func getFailedOnlyBackupQueryFn(backupDSRange *dataSetRangeT, backupRowsBatchSize, backupMaxTotalPayloadSize int64) func(int64) string {
 	return func(offSet int64) string {
 		return fmt.Sprintf(
 			`SELECT
@@ -400,7 +465,7 @@ func getFailedOnlyBackupQueryFn(backupDSRange *dataSetRangeT) func(int64) string
 	}
 }
 
-func getJobsBackupQueryFn(backupDSRange *dataSetRangeT) func(int64) string {
+func getJobsBackupQueryFn(backupDSRange *dataSetRangeT, backupRowsBatchSize, backupMaxTotalPayloadSize int64) func(int64) string {
 	return func(offSet int64) string {
 		return fmt.Sprintf(`
 			SELECT
@@ -457,7 +522,7 @@ func getJobsBackupQueryFn(backupDSRange *dataSetRangeT) func(int64) string {
 	}
 }
 
-func getStatusBackupQueryFn(backupDSRange *dataSetRangeT) func(int64) string {
+func getStatusBackupQueryFn(backupDSRange *dataSetRangeT, backupRowsBatchSize int64) func(int64) string {
 	return func(offSet int64) string {
 		return fmt.Sprintf(`
 			SELECT
@@ -494,7 +559,7 @@ func getStatusBackupQueryFn(backupDSRange *dataSetRangeT) func(int64) string {
 	}
 }
 
-func (jd *HandleT) createTableDumps(queryFunc func(int64) string, pathFunc func(string) (string, error), totalCount int64) (map[string]string, error) {
+func (jd *Handle) createTableDumps(ctx context.Context, queryFunc func(int64) string, pathFunc func(string) (string, error), totalCount int64) (map[string]string, error) {
 	defer jd.getTimerStat(
 		"table_FileDump_TimeStat",
 		&statTags{CustomValFilters: []string{jd.tablePrefix}},
@@ -507,7 +572,7 @@ func (jd *HandleT) createTableDumps(queryFunc func(int64) string, pathFunc func(
 		stmt := queryFunc(offset)
 		var rawJSONRows json.RawMessage
 		var workspaceID string
-		rows, err := jd.dbHandle.Query(stmt)
+		rows, err := jd.dbHandle.QueryContext(ctx, stmt)
 		if err != nil {
 			return fmt.Errorf("error while getting rows: %w", err)
 		}
@@ -518,19 +583,29 @@ func (jd *HandleT) createTableDumps(queryFunc func(int64) string, pathFunc func(
 			if err != nil {
 				return fmt.Errorf("scanning row failed with error : %w", err)
 			}
-			preferences, err := jd.fileUploaderProvider.GetStoragePreferences(workspaceID)
+			preferences, err := jd.conf.backup.fileUploaderProvider.GetStoragePreferences(workspaceID)
+			if errors.Is(err, fileuploader.NoStorageForWorkspaceError) {
+				offset++
+				jd.logger.Debugw(
+					"getting storage preferences failed",
+					"workspaceId", workspaceID,
+					"error", err.Error(),
+				)
+				continue
+			}
 			if err != nil {
-				return fmt.Errorf("getting storage preferences failed with error : %w", err)
+				return fmt.Errorf("getting storage preferences failed with error: %w for workspaceID: %s", err, workspaceID)
 			}
 			if !preferences.Backup(jd.tablePrefix) {
 				offset++
-				jd.logger.Infof("Skipping backup for workspace: %s. Preferences: %v and tablePrefix: %s", workspaceID, preferences, jd.tablePrefix)
+				jd.logger.Debugw(
+					"skipping backup Preferences",
+					"workspaceId", workspaceID,
+					"preferences", preferences,
+				)
 				continue
 			}
 			rawJSONRows = append(rawJSONRows, '\n') // appending '\n'
-			if err != nil {
-				return fmt.Errorf("error while appending '\n': %w", err)
-			}
 			path, err := pathFunc(workspaceID)
 			if err != nil {
 				return fmt.Errorf("error while getting path: %w", err)
@@ -543,6 +618,9 @@ func (jd *HandleT) createTableDumps(queryFunc func(int64) string, pathFunc func(
 				dumps[workspaceID] = path
 			}
 			offset++
+		}
+		if err := rows.Err(); err != nil {
+			return fmt.Errorf("error while iterating rows: %w", err)
 		}
 		return nil
 	}
@@ -563,7 +641,7 @@ func (jd *HandleT) createTableDumps(queryFunc func(int64) string, pathFunc func(
 	return dumps, nil
 }
 
-func (jd *HandleT) uploadTableDump(ctx context.Context, workspaceID, path string) error {
+func (jd *Handle) uploadTableDump(ctx context.Context, workspaceID, path string) error {
 	defer jd.getTimerStat(
 		"fileUpload_TimeStat",
 		&statTags{CustomValFilters: []string{jd.tablePrefix}},
@@ -577,35 +655,37 @@ func (jd *HandleT) uploadTableDump(ctx context.Context, workspaceID, path string
 
 	pathPrefixes := make([]string, 0)
 	// For empty path prefix, don't need to add anything to the array
-	if jd.BackupSettings.PathPrefix != "" {
-		pathPrefixes = append(pathPrefixes, jd.BackupSettings.PathPrefix, config.GetString("INSTANCE_ID", "1"))
+	if jd.conf.backup.PathPrefix != "" {
+		pathPrefixes = append(pathPrefixes, jd.conf.backup.PathPrefix, jd.config.GetString("INSTANCE_ID", "1"))
 	} else {
-		pathPrefixes = append(pathPrefixes, config.GetString("INSTANCE_ID", "1"))
+		pathPrefixes = append(pathPrefixes, jd.config.GetString("INSTANCE_ID", "1"))
 	}
 
-	var output filemanager.UploadOutput
+	var output filemanager.UploadedFile
 	output, err = jd.backupUploadWithExponentialBackoff(ctx, file, workspaceID, pathPrefixes...)
 	if err != nil {
-		jd.logger.Errorf("[JobsDB] :: Failed to upload table dump for workspaceId %s. Error: %s", workspaceID, err.Error())
-		return err
+		return fmt.Errorf("failed to upload table dump: %w", err)
 	}
-	jd.logger.Infof("[JobsDB] :: Backed up table at %s for workspaceId %s", output.Location, workspaceID)
+	jd.logger.Debugw("backed up table dump",
+		"location", output.Location,
+		"workspaceId", workspaceID,
+	)
 	return nil
 }
 
-func (jd *HandleT) backupUploadWithExponentialBackoff(ctx context.Context, file *os.File, workspaceID string, pathPrefixes ...string) (filemanager.UploadOutput, error) {
+func (jd *Handle) backupUploadWithExponentialBackoff(ctx context.Context, file *os.File, workspaceID string, pathPrefixes ...string) (filemanager.UploadedFile, error) {
 	// get a file uploader
-	fileUploader, err := jd.fileUploaderProvider.GetFileManager(workspaceID)
+	fileUploader, err := jd.conf.backup.fileUploaderProvider.GetFileManager(workspaceID)
 	if err != nil {
-		return filemanager.UploadOutput{}, err
+		return filemanager.UploadedFile{}, err
 	}
 	bo := backoff.NewExponentialBackOff()
 	bo.MaxInterval = time.Minute
-	bo.MaxElapsedTime = jd.maxBackupRetryTime
-	boRetries := backoff.WithMaxRetries(bo, uint64(config.GetInt64("MAX_BACKOFF_RETRIES", 3)))
+	bo.MaxElapsedTime = jd.conf.backup.maxBackupRetryTime.Load()
+	boRetries := backoff.WithMaxRetries(bo, uint64(jd.config.GetInt64("MAX_BACKOFF_RETRIES", 3)))
 	boCtx := backoff.WithContext(boRetries, ctx)
 
-	var output filemanager.UploadOutput
+	var output filemanager.UploadedFile
 	backup := func() error {
 		output, err = fileUploader.Upload(ctx, file, pathPrefixes...)
 		return err
@@ -615,13 +695,15 @@ func (jd *HandleT) backupUploadWithExponentialBackoff(ctx context.Context, file 
 	return output, err
 }
 
-func (jd *HandleT) getBackupDSRange() *dataSetRangeT {
+func (jd *Handle) getBackupDSRange(ctx context.Context) (*dataSetRangeT, error) {
 	var backupDS dataSetT
 	var backupDSRange dataSetRangeT
 
 	// Read the table names from PG
-	tableNames := mustGetAllTableNames(jd, jd.dbHandle)
-
+	tableNames, err := getAllTableNames(jd.dbHandle)
+	if err != nil {
+		return nil, fmt.Errorf("getAllTableNames: %w", err)
+	}
 	// We check for job_status because that is renamed after job
 	var dnumList []string
 	for _, t := range tableNames {
@@ -632,7 +714,7 @@ func (jd *HandleT) getBackupDSRange() *dataSetRangeT {
 		}
 	}
 	if len(dnumList) == 0 {
-		return &backupDSRange
+		return &backupDSRange, nil
 	}
 	jd.statPreDropTableCount.Gauge(len(dnumList))
 
@@ -646,15 +728,19 @@ func (jd *HandleT) getBackupDSRange() *dataSetRangeT {
 
 	var minID, maxID sql.NullInt64
 	jobIDSQLStatement := fmt.Sprintf(`SELECT MIN(job_id), MAX(job_id) from %q`, backupDS.JobTable)
-	row := jd.dbHandle.QueryRow(jobIDSQLStatement)
-	err := row.Scan(&minID, &maxID)
-	jd.assertError(err)
+	row := jd.dbHandle.QueryRowContext(ctx, jobIDSQLStatement)
+	err = row.Scan(&minID, &maxID)
+	if err != nil {
+		return nil, fmt.Errorf("getting min and max job_id: %w", err)
+	}
 
 	var minCreatedAt, maxCreatedAt time.Time
 	jobTimeSQLStatement := fmt.Sprintf(`SELECT MIN(created_at), MAX(created_at) from %q`, backupDS.JobTable)
-	row = jd.dbHandle.QueryRow(jobTimeSQLStatement)
+	row = jd.dbHandle.QueryRowContext(ctx, jobTimeSQLStatement)
 	err = row.Scan(&minCreatedAt, &maxCreatedAt)
-	jd.assertError(err)
+	if err != nil {
+		return nil, fmt.Errorf("getting min and max created_at: %w", err)
+	}
 
 	backupDSRange = dataSetRangeT{
 		minJobID:  minID.Int64,
@@ -663,5 +749,5 @@ func (jd *HandleT) getBackupDSRange() *dataSetRangeT {
 		endTime:   maxCreatedAt.UnixNano() / int64(time.Millisecond),
 		ds:        backupDS,
 	}
-	return &backupDSRange
+	return &backupDSRange, nil
 }

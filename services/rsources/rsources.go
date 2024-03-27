@@ -3,11 +3,12 @@ package rsources
 import (
 	"context"
 	"database/sql"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
 
-	"github.com/rudderlabs/rudder-server/utils/logger"
+	"github.com/rudderlabs/rudder-go-kit/logger"
 )
 
 //go:generate mockgen -source=rsources.go -destination=mock_rsources.go -package=rsources github.com/rudderlabs/rudder-server/services/rsources JobService
@@ -33,13 +34,58 @@ type Stats struct {
 	Failed uint `json:"failed"`
 }
 
-func (r Stats) completed() bool {
+func (r *Stats) completed() bool {
 	return r.In == r.Out+r.Failed
+}
+
+func (r *Stats) corrupted() bool {
+	return r.In < r.Out+r.Failed
+}
+
+func (r *Stats) fixCorrupted() {
+	if r.corrupted() {
+		r.In = r.Out + r.Failed
+	}
 }
 
 type JobStatus struct {
 	ID          string       `json:"id"`
 	TasksStatus []TaskStatus `json:"tasks"`
+}
+
+func (js *JobStatus) FixCorruptedStats(log logger.Logger) {
+	isCorrupted := func() bool {
+		for ti := range js.TasksStatus {
+			for si := range js.TasksStatus[ti].SourcesStatus {
+				if js.TasksStatus[ti].SourcesStatus[si].Stats.corrupted() {
+					return true
+				}
+				for di := range js.TasksStatus[ti].SourcesStatus[si].DestinationsStatus {
+					if js.TasksStatus[ti].SourcesStatus[si].DestinationsStatus[di].Stats.corrupted() {
+						return true
+					}
+				}
+			}
+		}
+		return false
+	}
+	fixCorrupted := func() {
+		for ti := range js.TasksStatus {
+			for si := range js.TasksStatus[ti].SourcesStatus {
+				js.TasksStatus[ti].SourcesStatus[si].Stats.fixCorrupted()
+				js.TasksStatus[ti].SourcesStatus[si].Completed = js.TasksStatus[ti].SourcesStatus[si].Stats.completed()
+				for di := range js.TasksStatus[ti].SourcesStatus[si].DestinationsStatus {
+					js.TasksStatus[ti].SourcesStatus[si].DestinationsStatus[di].Stats.fixCorrupted()
+					js.TasksStatus[ti].SourcesStatus[si].DestinationsStatus[di].Completed = js.TasksStatus[ti].SourcesStatus[si].DestinationsStatus[di].Stats.completed()
+				}
+			}
+		}
+	}
+	if isCorrupted() {
+		corruptedJson, _ := json.Marshal(js)
+		log.Warnw("Corrupted job status stats detected, fixing", "job_status", string(corruptedJson))
+		fixCorrupted()
+	}
 }
 
 type TaskStatus struct {
@@ -74,33 +120,72 @@ type DestinationStatus struct {
 	Stats     Stats  `json:"stats"`
 }
 
-type JobFailedRecords struct {
-	ID    string              `json:"id"`
-	Tasks []TaskFailedRecords `json:"tasks"`
+type PagingInfo struct {
+	Size          int    `json:"size"`
+	NextPageToken string `json:"next"`
 }
 
-type TaskFailedRecords struct {
-	ID      string                `json:"id"`
-	Sources []SourceFailedRecords `json:"sources"`
+func NextPageTokenFromString(v string) (NextPageToken, error) {
+	var npt NextPageToken
+	if v == "" {
+		return npt, nil
+	}
+	s, err := base64.URLEncoding.DecodeString(v)
+	if err != nil {
+		return npt, err
+	}
+	err = json.Unmarshal(s, &npt)
+	return npt, err
 }
 
-type SourceFailedRecords struct {
-	ID           string                     `json:"id"`
-	Records      FailedRecords              `json:"records"`
-	Destinations []DestinationFailedRecords `json:"destinations"`
+type NextPageToken struct {
+	ID       string `json:"id"`
+	RecordID string `json:"record_id"`
 }
 
-type DestinationFailedRecords struct {
-	ID      string        `json:"id"`
-	Records FailedRecords `json:"records"`
+func (npt *NextPageToken) String() string {
+	s, _ := json.Marshal(npt)
+	return base64.URLEncoding.EncodeToString(s)
 }
-type FailedRecords []json.RawMessage
+
+type (
+	JobFailedRecordsV2      JobFailedRecords[FailedRecord]
+	JobFailedRecordsV1      JobFailedRecords[json.RawMessage]
+	JobFailedRecords[R any] struct {
+		ID     string                 `json:"id"`
+		Tasks  []TaskFailedRecords[R] `json:"tasks"`
+		Paging *PagingInfo            `json:"paging,omitempty"`
+	}
+)
+
+type TaskFailedRecords[R any] struct {
+	ID      string                   `json:"id"`
+	Sources []SourceFailedRecords[R] `json:"sources"`
+}
+
+type SourceFailedRecords[R any] struct {
+	ID           string                        `json:"id"`
+	Records      []R                           `json:"records"`
+	Destinations []DestinationFailedRecords[R] `json:"destinations"`
+}
+
+type DestinationFailedRecords[R any] struct {
+	ID      string `json:"id"`
+	Records []R    `json:"records"`
+}
+type FailedRecord struct {
+	Record json.RawMessage `json:"record"`
+	Code   int             `json:"code"`
+}
 
 // ErrStatusNotFound sentinel error indicating that status cannot be found
 var ErrStatusNotFound = errors.New("Status not found")
 
 // ErrSourceNotCompleted sentinel error indicating that a source is not completed
 var ErrSourceNotCompleted = errors.New("Source not completed")
+
+// ErrFailedRecordsNotFound sentinel error indicating that failed records cannot be found
+var ErrFailedRecordsNotFound = errors.New("Failed records not found")
 
 // StatsIncrementer increments stats
 type StatsIncrementer interface {
@@ -113,10 +198,12 @@ type JobServiceConfig struct {
 	LocalHostname               string
 	LocalConn                   string
 	MaxPoolSize                 int
+	MinPoolSize                 int
 	SharedConn                  string
 	SubscriptionTargetConn      string
 	SkipFailedRecordsCollection bool
 	Log                         logger.Logger
+	ShouldSetupSharedDB         bool
 }
 
 // JobService manages information about jobs created by rudder-sources
@@ -126,14 +213,23 @@ type JobService interface {
 	// Delete deletes all relevant information for a given jobRunId
 	Delete(ctx context.Context, jobRunId string, filter JobFilter) error
 
+	// DeleteJobStatus deletes the status for a given jobRunId
+	DeleteJobStatus(ctx context.Context, jobRunId string, filter JobFilter) error
+
+	// DeleteFailedRecords deletes all failed records for a given jobRunId
+	DeleteFailedRecords(ctx context.Context, jobRunId string, filter JobFilter) error
+
 	// GetStatus gets the current status of a job
 	GetStatus(ctx context.Context, jobRunId string, filter JobFilter) (JobStatus, error)
 
 	// AddFailedRecords adds failed records to the database as part of a transaction
-	AddFailedRecords(ctx context.Context, tx *sql.Tx, jobRunId string, key JobTargetKey, records []json.RawMessage) error
+	AddFailedRecords(ctx context.Context, tx *sql.Tx, jobRunId string, key JobTargetKey, records []FailedRecord) error
 
 	// GetFailedRecords gets the failed records for a jobRunID, with filters on taskRunId and sourceId
-	GetFailedRecords(ctx context.Context, jobRunId string, filter JobFilter) (JobFailedRecords, error)
+	GetFailedRecords(ctx context.Context, jobRunId string, filter JobFilter, paging PagingInfo) (JobFailedRecordsV2, error)
+
+	// GetFailedRecordsV1 gets the failed records for a jobRunID, with filters on taskRunId and sourceId
+	GetFailedRecordsV1(ctx context.Context, jobRunId string, filter JobFilter, paging PagingInfo) (JobFailedRecordsV1, error)
 
 	// CleanupLoop starts the cleanup loop in the background which will stop upon context termination or in case of an error
 	CleanupLoop(ctx context.Context) error
@@ -149,6 +245,12 @@ type Gauger interface {
 func NewJobService(config JobServiceConfig) (JobService, error) {
 	if config.Log == nil {
 		config.Log = logger.NewLogger().Child("rsources")
+	}
+	if config.MaxPoolSize <= 2 {
+		config.MaxPoolSize = 2 // minimum 2 connections in the pool for proper startup
+	}
+	if config.MinPoolSize <= 0 {
+		config.MinPoolSize = 1
 	}
 	var (
 		localDB, sharedDB *sql.DB
@@ -167,6 +269,7 @@ func NewJobService(config JobServiceConfig) (JobService, error) {
 			return nil, fmt.Errorf("failed to create shared postgresql connection pool: %w", err)
 		}
 		sharedDB.SetMaxOpenConns(config.MaxPoolSize)
+		sharedDB.SetMaxIdleConns(config.MinPoolSize)
 	}
 	handler := &sourcesHandler{
 		log:      config.Log,
@@ -188,6 +291,14 @@ func (*noopService) Delete(_ context.Context, _ string, _ JobFilter) error {
 	return nil
 }
 
+func (*noopService) DeleteJobStatus(_ context.Context, _ string, _ JobFilter) error {
+	return nil
+}
+
+func (*noopService) DeleteFailedRecords(_ context.Context, _ string, _ JobFilter) error {
+	return nil
+}
+
 func (*noopService) GetStatus(_ context.Context, _ string, _ JobFilter) (JobStatus, error) {
 	return JobStatus{}, nil
 }
@@ -196,12 +307,16 @@ func (*noopService) IncrementStats(_ context.Context, _ *sql.Tx, _ string, _ Job
 	return nil
 }
 
-func (*noopService) AddFailedRecords(_ context.Context, _ *sql.Tx, _ string, _ JobTargetKey, _ []json.RawMessage) error {
+func (*noopService) AddFailedRecords(_ context.Context, _ *sql.Tx, _ string, _ JobTargetKey, _ []FailedRecord) error {
 	return nil
 }
 
-func (*noopService) GetFailedRecords(_ context.Context, _ string, _ JobFilter) (JobFailedRecords, error) {
-	return JobFailedRecords{}, nil
+func (*noopService) GetFailedRecords(_ context.Context, _ string, _ JobFilter, _ PagingInfo) (JobFailedRecordsV2, error) {
+	return JobFailedRecordsV2{}, nil
+}
+
+func (*noopService) GetFailedRecordsV1(_ context.Context, _ string, _ JobFilter, _ PagingInfo) (JobFailedRecordsV1, error) {
+	return JobFailedRecordsV1{}, nil
 }
 
 func (*noopService) CleanupLoop(ctx context.Context) error {

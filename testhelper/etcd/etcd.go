@@ -2,8 +2,8 @@ package etcd
 
 import (
 	"fmt"
-	"runtime"
 	"strconv"
+	"time"
 
 	"github.com/ory/dockertest/v3"
 	etcd "go.etcd.io/etcd/client/v3"
@@ -23,9 +23,6 @@ type Resource struct {
 
 func Setup(pool *dockertest.Pool, cln cleaner) (*Resource, error) {
 	etcdImage := "bitnami/etcd"
-	if runtime.GOARCH == "arm64" {
-		etcdImage = "zcube/bitnami-compat-etcd"
-	}
 	container, err := pool.Run(etcdImage, "3.5", []string{
 		"ALLOW_NONE_AUTHENTICATION=yes",
 	})
@@ -57,6 +54,7 @@ func Setup(pool *dockertest.Pool, cln cleaner) (*Resource, error) {
 			DialOptions: []grpc.DialOption{
 				grpc.WithBlock(), // block until the underlying connection is up
 			},
+			DialTimeout: 10 * time.Second,
 		})
 		return err
 	})

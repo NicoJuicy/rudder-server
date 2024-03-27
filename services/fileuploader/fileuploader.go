@@ -5,15 +5,18 @@ import (
 	"fmt"
 	"sync"
 
-	"github.com/rudderlabs/rudder-server/config"
-	backendconfig "github.com/rudderlabs/rudder-server/config/backend-config"
-	"github.com/rudderlabs/rudder-server/services/filemanager"
+	"github.com/rudderlabs/rudder-go-kit/config"
+	"github.com/rudderlabs/rudder-go-kit/filemanager"
+	backendconfig "github.com/rudderlabs/rudder-server/backend-config"
+	"github.com/rudderlabs/rudder-server/utils/filemanagerutil"
 )
 
 type StorageSettings struct {
 	Bucket      backendconfig.StorageBucket
 	Preferences backendconfig.StoragePreferences
 }
+
+var NoStorageForWorkspaceError = fmt.Errorf("no storage settings found for workspace")
 
 // Provider is an interface that provides file managers and storage preferences for a given workspace.
 type Provider interface {
@@ -54,27 +57,37 @@ func NewDefaultProvider() Provider {
 type provider struct {
 	onceInit        sync.Once
 	init            chan struct{}
+	mu              sync.RWMutex
 	storageSettings map[string]StorageSettings
 }
 
-func (p *provider) GetFileManager(workspaceID string) (filemanager.FileManager, error) {
+func (p *provider) getStorageSettings(workspaceID string) (StorageSettings, error) {
 	<-p.init
+	p.mu.RLock()
+	defer p.mu.RUnlock()
 	settings, ok := p.storageSettings[workspaceID]
 	if !ok {
-		return nil, fmt.Errorf("no storage settings found for workspace: %s", workspaceID)
+		return StorageSettings{}, NoStorageForWorkspaceError
 	}
-	return filemanager.DefaultFileManagerFactory.New(&filemanager.SettingsT{
+	return settings, nil
+}
+
+func (p *provider) GetFileManager(workspaceID string) (filemanager.FileManager, error) {
+	settings, err := p.getStorageSettings(workspaceID)
+	if err != nil {
+		return nil, err
+	}
+	return filemanager.New(&filemanager.Settings{
 		Provider: settings.Bucket.Type,
 		Config:   settings.Bucket.Config,
 	})
 }
 
 func (p *provider) GetStoragePreferences(workspaceID string) (backendconfig.StoragePreferences, error) {
-	<-p.init
 	var prefs backendconfig.StoragePreferences
-	settings, ok := p.storageSettings[workspaceID]
-	if !ok {
-		return prefs, fmt.Errorf("no storage settings found for workspace: %s", workspaceID)
+	settings, err := p.getStorageSettings(workspaceID)
+	if err != nil {
+		return prefs, err
 	}
 	return settings.Preferences, nil
 }
@@ -83,9 +96,8 @@ func (p *provider) GetStoragePreferences(workspaceID string) (backendconfig.Stor
 func (p *provider) updateLoop(ctx context.Context, backendConfig backendconfig.BackendConfig) {
 	ch := backendConfig.Subscribe(ctx, backendconfig.TopicBackendConfig)
 
-	settings := make(map[string]StorageSettings)
-
 	for ev := range ch {
+		settings := make(map[string]StorageSettings)
 		configs := ev.Data.(map[string]backendconfig.ConfigT)
 		for workspaceId, c := range configs {
 
@@ -98,6 +110,12 @@ func (p *provider) updateLoop(ctx context.Context, backendConfig backendconfig.B
 				bucket = overrideWithSettings(defaultBucket.Config, settings, workspaceId)
 			} else {
 				bucket = getDefaultBucket(ctx, config.GetString("JOBS_BACKUP_STORAGE_PROVIDER", "S3"))
+				switch c.Settings.DataRetention.RetentionPeriod {
+				case "default":
+					bucket.Config["prefix"] = config.GetString("JOBS_BACKUP_DEFAULT_PREFIX", "7dayretention")
+				case "full":
+				default:
+				}
 			}
 			// bucket type and configuration must not be empty
 			if bucket.Type != "" && len(bucket.Config) > 0 {
@@ -108,7 +126,9 @@ func (p *provider) updateLoop(ctx context.Context, backendConfig backendconfig.B
 				Preferences: preferences,
 			}
 		}
+		p.mu.Lock()
 		p.storageSettings = settings
+		p.mu.Unlock()
 		p.onceInit.Do(func() {
 			close(p.init)
 		})
@@ -123,7 +143,7 @@ type defaultProvider struct{}
 
 func (*defaultProvider) GetFileManager(_ string) (filemanager.FileManager, error) {
 	defaultConfig := getDefaultBucket(context.Background(), config.GetString("JOBS_BACKUP_STORAGE_PROVIDER", "S3"))
-	return filemanager.DefaultFileManagerFactory.New(&filemanager.SettingsT{
+	return filemanager.New(&filemanager.Settings{
 		Provider: defaultConfig.Type,
 		Config:   defaultConfig.Config,
 	})
@@ -142,7 +162,7 @@ func (*defaultProvider) GetStoragePreferences(_ string) (backendconfig.StoragePr
 func getDefaultBucket(ctx context.Context, provider string) backendconfig.StorageBucket {
 	return backendconfig.StorageBucket{
 		Type:   provider,
-		Config: filemanager.GetProviderConfigFromEnv(ctx, provider),
+		Config: filemanager.GetProviderConfigFromEnv(filemanagerutil.ProviderConfigOpts(ctx, provider, config.Default)),
 	}
 }
 
@@ -154,8 +174,8 @@ func overrideWithSettings(defaultConfig map[string]interface{}, settings backend
 	for k, v := range settings.Config {
 		config[k] = v
 	}
-	if _, ok := config["externalId"]; ok && settings.Type == "S3" {
-		config["externalId"] = workspaceID
+	if settings.Type == "S3" && config["iamRoleArn"] != nil {
+		config["externalID"] = workspaceID
 	}
 	return backendconfig.StorageBucket{
 		Type:   settings.Type,

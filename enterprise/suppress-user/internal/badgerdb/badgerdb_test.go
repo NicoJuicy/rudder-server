@@ -10,13 +10,15 @@ import (
 	"testing"
 	"time"
 
-	"github.com/dgraph-io/badger/v3"
+	badger "github.com/dgraph-io/badger/v4"
 
 	"github.com/google/uuid"
+	"github.com/stretchr/testify/require"
+
+	"github.com/rudderlabs/rudder-go-kit/logger"
+	"github.com/rudderlabs/rudder-go-kit/stats"
 	"github.com/rudderlabs/rudder-server/enterprise/suppress-user/internal/badgerdb"
 	"github.com/rudderlabs/rudder-server/enterprise/suppress-user/model"
-	"github.com/rudderlabs/rudder-server/utils/logger"
-	"github.com/stretchr/testify/require"
 )
 
 type readerFunc func(p []byte) (n int, err error)
@@ -29,8 +31,44 @@ func (f readerFunc) Read(p []byte) (n int, err error) {
 func TestBadgerRepository(t *testing.T) {
 	basePath := path.Join(t.TempDir(), strings.ReplaceAll(uuid.New().String(), "-", ""))
 	token := []byte("token")
-	repo, err := badgerdb.NewRepository(basePath, logger.NOP)
+	repo, err := badgerdb.NewRepository(basePath, logger.NOP, stats.Default)
 	require.NoError(t, err)
+
+	t.Run("adding suppressions with createdAt", func(t *testing.T) {
+		err := repo.Add([]model.Suppression{
+			{
+				WorkspaceID: "workspace1",
+				UserID:      "user1",
+				SourceIDs:   []string{},
+				CreatedAt:   time.Date(2020, time.March, 27, 2, 2, 1, 2, time.UTC),
+			},
+		}, token)
+		require.NoError(t, err)
+		metadata, err := repo.Suppressed("workspace1", "user1", "")
+		require.NoError(t, err)
+		require.Equal(t, time.Date(2020, time.March, 27, 2, 2, 1, 2, time.UTC), metadata.CreatedAt) // should be the same as the one we added
+		metadata, err = repo.Suppressed("workspace2", "user1", "")
+		require.Error(t, err)
+		require.Nil(t, metadata) // should be nil
+
+		// Add a suppression with a source ID
+		err = repo.Add([]model.Suppression{
+			{
+				WorkspaceID: "workspace2",
+				UserID:      "user2",
+				SourceIDs:   []string{"source2"},
+				CreatedAt:   time.Date(2019, time.March, 27, 2, 2, 1, 2, time.UTC),
+			},
+		}, token)
+		require.NoError(t, err)
+		metadata, err = repo.Suppressed("workspace2", "user2", "source1") // wrong source ID
+		require.Error(t, err)
+		require.Nil(t, metadata)
+		metadata, err = repo.Suppressed("workspace2", "user2", "source2") // wrong workspace and user ID and correct source ID
+		require.NoError(t, err)
+		require.NotNil(t, metadata)
+		require.Equal(t, time.Date(2019, time.March, 27, 2, 2, 1, 2, time.UTC), metadata.CreatedAt) // should be the same as the one we added
+	})
 
 	t.Run("trying to use a repository during restore", func(t *testing.T) {
 		ctx, cancel := context.WithCancel(context.Background())
@@ -53,11 +91,13 @@ func TestBadgerRepository(t *testing.T) {
 				WorkspaceID: "workspace1",
 				UserID:      "user1",
 				SourceIDs:   []string{},
+				CreatedAt:   time.Now(),
 			},
 			{
 				WorkspaceID: "workspace2",
 				UserID:      "user2",
 				SourceIDs:   []string{"source1"},
+				CreatedAt:   time.Now(),
 			},
 		}, token)
 		require.Error(t, err, "it should return an error when trying to add a suppression to a repository that is restoring")
@@ -86,7 +126,7 @@ func TestBadgerRepository(t *testing.T) {
 	defer func() { _ = repo.Stop() }()
 
 	t.Run("trying to start a second repository using the same path", func(t *testing.T) {
-		_, err := badgerdb.NewRepository(basePath, logger.NOP)
+		_, err := badgerdb.NewRepository(basePath, logger.NOP, stats.Default)
 		require.Error(t, err, "it should return an error when trying to start a second repository using the same path")
 	})
 
@@ -102,8 +142,8 @@ func TestBadgerRepository(t *testing.T) {
 
 	t.Run("new with seeder", func(t *testing.T) {
 		basePath := path.Join(t.TempDir(), "badger-test-2")
-		_, err := badgerdb.NewRepository(basePath, logger.NOP, badgerdb.WithSeederSource(func() (io.Reader, error) {
-			return buffer, nil
+		_, err := badgerdb.NewRepository(basePath, logger.NOP, stats.Default, badgerdb.WithSeederSource(func() (io.ReadCloser, error) {
+			return io.NopCloser(buffer), nil
 		}), badgerdb.WithMaxSeedWait(1*time.Millisecond))
 		require.NoError(t, err)
 	})
@@ -128,18 +168,19 @@ func TestBadgerRepository(t *testing.T) {
 			WorkspaceID: "workspace1",
 			UserID:      "user1",
 			SourceIDs:   []string{},
+			CreatedAt:   time.Now(),
 		}}, []byte("token")))
 	})
 
 	t.Run("trying to use a closed repository", func(t *testing.T) {
-		repo, err := badgerdb.NewRepository(basePath, logger.NOP)
+		repo, err := badgerdb.NewRepository(basePath, logger.NOP, stats.Default)
 		require.NoError(t, err)
 		require.NoError(t, repo.Stop())
 
 		require.Equal(t, repo.Add(nil, nil), badger.ErrDBClosed)
 
 		s, err := repo.Suppressed("", "", "")
-		require.False(t, s)
+		require.Nil(t, s)
 		require.Equal(t, err, badger.ErrDBClosed)
 
 		_, err = repo.GetToken()

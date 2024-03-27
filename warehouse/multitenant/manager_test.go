@@ -4,12 +4,15 @@ import (
 	"context"
 	"testing"
 
-	backendconfig "github.com/rudderlabs/rudder-server/config/backend-config"
+	"github.com/rudderlabs/rudder-go-kit/config"
+
+	"github.com/stretchr/testify/require"
+	"golang.org/x/sync/errgroup"
+
+	backendconfig "github.com/rudderlabs/rudder-server/backend-config"
 	"github.com/rudderlabs/rudder-server/services/controlplane/identity"
 	"github.com/rudderlabs/rudder-server/utils/pubsub"
 	"github.com/rudderlabs/rudder-server/warehouse/multitenant"
-	"github.com/stretchr/testify/require"
-	"golang.org/x/sync/errgroup"
 )
 
 var _ backendconfig.BackendConfig = (*mockBackendConfig)(nil)
@@ -91,12 +94,13 @@ func TestDegradeWorkspace(t *testing.T) {
 					WorkspaceID: workspace,
 				}
 			}
-			m := multitenant.Manager{
-				BackendConfig: &mockBackendConfig{
-					config: backendConfig,
-				},
-				DegradedWorkspaceIDs: tc.degradedWorkspaces,
-			}
+
+			c := config.New()
+			c.Set("Warehouse.degradedWorkspaceIDs", tc.degradedWorkspaces)
+
+			m := multitenant.New(c, &mockBackendConfig{
+				config: backendConfig,
+			})
 
 			ctx, cancel := context.WithCancel(context.Background())
 			defer cancel()
@@ -146,11 +150,9 @@ func TestSourceToWorkspace(t *testing.T) {
 		backendConfig[workspace] = entry
 	}
 
-	m := multitenant.Manager{
-		BackendConfig: &mockBackendConfig{
-			config: backendConfig,
-		},
-	}
+	m := multitenant.New(config.New(), &mockBackendConfig{
+		config: backendConfig,
+	})
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -175,11 +177,9 @@ func TestSourceToWorkspace(t *testing.T) {
 	require.NoError(t, g.Wait())
 
 	t.Run("context canceled", func(t *testing.T) {
-		m := multitenant.Manager{
-			BackendConfig: &mockBackendConfig{
-				config: backendConfig,
-			},
-		}
+		m := multitenant.New(config.New(), &mockBackendConfig{
+			config: backendConfig,
+		})
 		ctx, cancel := context.WithCancel(context.Background())
 		cancel()
 

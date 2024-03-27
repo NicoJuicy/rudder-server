@@ -5,45 +5,23 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"sync"
 	"time"
 
 	"golang.org/x/sync/errgroup"
 
 	"github.com/google/uuid"
-	"github.com/rudderlabs/rudder-server/config"
+	"github.com/samber/lo"
+
+	"github.com/rudderlabs/rudder-go-kit/bytesize"
+	"github.com/rudderlabs/rudder-go-kit/config"
+	"github.com/rudderlabs/rudder-go-kit/logger"
+	"github.com/rudderlabs/rudder-go-kit/stats"
 	"github.com/rudderlabs/rudder-server/jobsdb"
 	"github.com/rudderlabs/rudder-server/services/fileuploader"
-	"github.com/rudderlabs/rudder-server/services/stats"
 	"github.com/rudderlabs/rudder-server/services/transientsource"
-	"github.com/rudderlabs/rudder-server/utils/bytesize"
-	"github.com/rudderlabs/rudder-server/utils/logger"
 	"github.com/rudderlabs/rudder-server/utils/misc"
-	"github.com/samber/lo"
 )
-
-var (
-	errorStashEnabled       bool
-	errReadLoopSleep        time.Duration
-	errDBReadBatchSize      int
-	noOfErrStashWorkers     int
-	maxFailedCountForErrJob int
-	pkgLogger               logger.Logger
-	payloadLimit            int64
-)
-
-func Init() {
-	loadConfig()
-	pkgLogger = logger.NewLogger().Child("processor").Child("stash")
-}
-
-func loadConfig() {
-	config.RegisterBoolConfigVariable(true, &errorStashEnabled, true, "Processor.errorStashEnabled")
-	config.RegisterDurationConfigVariable(30, &errReadLoopSleep, true, time.Second, []string{"Processor.errReadLoopSleep", "errReadLoopSleepInS"}...)
-	config.RegisterIntConfigVariable(1000, &errDBReadBatchSize, true, 1, "Processor.errDBReadBatchSize")
-	config.RegisterIntConfigVariable(2, &noOfErrStashWorkers, true, 1, "Processor.noOfErrStashWorkers")
-	config.RegisterIntConfigVariable(3, &maxFailedCountForErrJob, true, 1, "Processor.maxFailedCountForErrJob")
-	config.RegisterInt64ConfigVariable(100*bytesize.MB, &payloadLimit, true, 1, "Processor.payloadLimit")
-}
 
 type StoreErrorOutputT struct {
 	Location string
@@ -56,30 +34,52 @@ type ErrorJob struct {
 }
 
 type HandleT struct {
-	errorDB                   jobsdb.JobsDB
-	errProcessQ               chan []*jobsdb.JobT
-	statErrDBR                stats.Measurement
-	logger                    logger.Logger
-	transientSource           transientsource.Service
-	fileuploader              fileuploader.Provider
-	jobsDBCommandTimeout      time.Duration
-	jobdDBQueryRequestTimeout time.Duration
-	jobdDBMaxRetries          int
+	errorDB         jobsdb.JobsDB
+	errProcessQ     chan []*jobsdb.JobT
+	statErrDBR      stats.Measurement
+	logger          logger.Logger
+	transientSource transientsource.Service
+	fileuploader    fileuploader.Provider
+
+	adaptiveLimit func(int64) int64
+	config        struct {
+		jobsDBCommandTimeout      misc.ValueLoader[time.Duration]
+		jobdDBQueryRequestTimeout misc.ValueLoader[time.Duration]
+		jobdDBMaxRetries          misc.ValueLoader[int]
+		errorStashEnabled         misc.ValueLoader[bool]
+		errDBReadBatchSize        misc.ValueLoader[int]
+		noOfErrStashWorkers       misc.ValueLoader[int]
+		maxFailedCountForErrJob   misc.ValueLoader[int]
+		pkgLogger                 logger.Logger
+		payloadLimit              misc.ValueLoader[int64]
+	}
 }
 
 func New() *HandleT {
 	return &HandleT{}
 }
 
-func (st *HandleT) Setup(errorDB jobsdb.JobsDB, transientSource transientsource.Service, fileuploader fileuploader.Provider) {
-	st.logger = pkgLogger
+func (st *HandleT) Setup(
+	errorDB jobsdb.JobsDB,
+	transientSource transientsource.Service,
+	fileuploader fileuploader.Provider,
+	adaptiveLimitFunc func(int64) int64,
+) {
+	st.config.errorStashEnabled = config.GetReloadableBoolVar(true, "Processor.errorStashEnabled")
+	st.config.errDBReadBatchSize = config.GetReloadableIntVar(1000, 1, "Processor.errDBReadBatchSize")
+	st.config.noOfErrStashWorkers = config.GetReloadableIntVar(2, 1, "Processor.noOfErrStashWorkers")
+	st.config.maxFailedCountForErrJob = config.GetReloadableIntVar(3, 1, "Processor.maxFailedCountForErrJob")
+	st.config.payloadLimit = config.GetReloadableInt64Var(100*bytesize.MB, 1, "Processor.stashPayloadLimit")
+	st.config.jobdDBMaxRetries = config.GetReloadableIntVar(2, 1, "JobsDB.Processor.MaxRetries", "JobsDB.MaxRetries")
+	st.config.jobdDBQueryRequestTimeout = config.GetReloadableDurationVar(600, time.Second, "JobsDB.Processor.QueryRequestTimeout", "JobsDB.QueryRequestTimeout")
+	st.config.jobsDBCommandTimeout = config.GetReloadableDurationVar(600, time.Second, "JobsDB.Processor.CommandRequestTimeout", "JobsDB.CommandRequestTimeout")
+
+	st.logger = logger.NewLogger().Child("processor").Child("stash")
 	st.errorDB = errorDB
 	st.statErrDBR = stats.Default.NewStat("processor.err_db_read_time", stats.TimerType)
 	st.transientSource = transientSource
 	st.fileuploader = fileuploader
-	config.RegisterIntConfigVariable(3, &st.jobdDBMaxRetries, true, 1, []string{"JobsDB.Processor.MaxRetries", "JobsDB.MaxRetries"}...)
-	config.RegisterDurationConfigVariable(60, &st.jobdDBQueryRequestTimeout, true, time.Second, []string{"JobsDB.Processor.QueryRequestTimeout", "JobsDB.QueryRequestTimeout"}...)
-	config.RegisterDurationConfigVariable(90, &st.jobsDBCommandTimeout, true, time.Second, []string{"JobsDB.Processor.CommandRequestTimeout", "JobsDB.CommandRequestTimeout"}...)
+	st.adaptiveLimit = adaptiveLimitFunc
 	st.crashRecover()
 }
 
@@ -103,24 +103,24 @@ func (st *HandleT) Start(ctx context.Context) {
 	_ = g.Wait()
 }
 
-func sendRetryUpdateStats(attempt int) {
-	pkgLogger.Warnf("Timeout during update job status in stash module, attempt %d", attempt)
+func (st *HandleT) sendRetryUpdateStats(attempt int) {
+	st.logger.Warnf("Timeout during update job status in stash module, attempt %d", attempt)
 	stats.Default.NewTaggedStat("jobsdb_update_timeout", stats.CountType, stats.Tags{"attempt": fmt.Sprint(attempt), "module": "stash"}).Count(1)
 }
 
-func sendQueryRetryStats(attempt int) {
-	pkgLogger.Warnf("Timeout during query jobs in stash module, attempt %d", attempt)
+func (st *HandleT) sendQueryRetryStats(attempt int) {
+	st.logger.Warnf("Timeout during query jobs in stash module, attempt %d", attempt)
 	stats.Default.NewTaggedStat("jobsdb_query_timeout", stats.CountType, stats.Tags{"attempt": fmt.Sprint(attempt), "module": "stash"}).Count(1)
 }
 
-func backupEnabled() bool {
-	return errorStashEnabled && jobsdb.IsMasterBackupEnabled()
+func (st *HandleT) backupEnabled(jd jobsdb.JobsDB) bool {
+	return st.config.errorStashEnabled.Load() && jd.IsMasterBackupEnabled()
 }
 
 func (st *HandleT) runErrWorkers(ctx context.Context) {
 	g, _ := errgroup.WithContext(ctx)
 
-	for i := 0; i < noOfErrStashWorkers; i++ {
+	for i := 0; i < st.config.noOfErrStashWorkers.Load(); i++ {
 		g.Go(misc.WithBugsnag(func() error {
 			for jobs := range st.errProcessQ {
 				uploadStart := time.Now()
@@ -208,12 +208,14 @@ func (st *HandleT) storeErrorsToObjectStorage(jobs []*jobsdb.JobT) (errorJob []E
 
 	g, _ := errgroup.WithContext(context.Background())
 	g.SetLimit(config.GetInt("Processor.errorBackupWorkers", 100))
+	var mu sync.Mutex
 	for workspaceID, filePath := range dumps {
 		wrkId := workspaceID
 		path := filePath
 		errFileUploader, err := st.fileuploader.GetFileManager(wrkId)
 		if err != nil {
 			st.logger.Errorf("Skipping Storing errors for workspace: %s since no file manager is found", workspaceID)
+			mu.Lock()
 			errorJobs = append(errorJobs, ErrorJob{
 				jobs: jobsPerWorkspace[workspaceID],
 				errorOutput: StoreErrorOutputT{
@@ -221,6 +223,7 @@ func (st *HandleT) storeErrorsToObjectStorage(jobs []*jobsdb.JobT) (errorJob []E
 					Error:    err,
 				},
 			})
+			mu.Unlock()
 			continue
 		}
 		g.Go(misc.WithBugsnag(func() error {
@@ -231,6 +234,7 @@ func (st *HandleT) storeErrorsToObjectStorage(jobs []*jobsdb.JobT) (errorJob []E
 			prefixes := []string{"rudder-proc-err-logs", time.Now().Format("01-02-2006")}
 			uploadOutput, err := errFileUploader.Upload(context.TODO(), outputFile, prefixes...)
 			st.logger.Infof("Uploaded error logs to %s for workspaceId %s", uploadOutput.Location, wrkId)
+			mu.Lock()
 			errorJobs = append(errorJobs, ErrorJob{
 				jobs: jobsPerWorkspace[wrkId],
 				errorOutput: StoreErrorOutputT{
@@ -238,6 +242,7 @@ func (st *HandleT) storeErrorsToObjectStorage(jobs []*jobsdb.JobT) (errorJob []E
 					Error:    err,
 				},
 			})
+			mu.Unlock()
 			return nil
 		}))
 	}
@@ -258,7 +263,7 @@ func (st *HandleT) setErrJobStatus(jobs []*jobsdb.JobT, output StoreErrorOutputT
 			if err != nil {
 				panic(err)
 			}
-			if job.LastJobStatus.AttemptNum >= maxFailedCountForErrJob {
+			if job.LastJobStatus.AttemptNum >= st.config.maxFailedCountForErrJob.Load() {
 				state = jobsdb.Aborted.State
 			} else {
 				state = jobsdb.Failed.State
@@ -273,69 +278,64 @@ func (st *HandleT) setErrJobStatus(jobs []*jobsdb.JobT, output StoreErrorOutputT
 			ErrorCode:     "",
 			ErrorResponse: errorResp,
 			Parameters:    []byte(`{}`),
+			JobParameters: job.Parameters,
 			WorkspaceId:   job.WorkspaceId,
 		}
 		statusList = append(statusList, &status)
 	}
-	err := misc.RetryWithNotify(context.Background(), st.jobsDBCommandTimeout, st.jobdDBMaxRetries, func(ctx context.Context) error {
+	err := misc.RetryWithNotify(context.Background(), st.config.jobsDBCommandTimeout.Load(), st.config.jobdDBMaxRetries.Load(), func(ctx context.Context) error {
 		return st.errorDB.UpdateJobStatus(ctx, statusList, nil, nil)
-	}, sendRetryUpdateStats)
+	}, st.sendRetryUpdateStats)
 	if err != nil {
-		pkgLogger.Errorf("Error occurred while updating proc error jobs statuses. Panicking. Err: %v", err)
+		st.logger.Errorf("Error occurred while updating proc error jobs statuses. Panicking. Err: %v", err)
 		panic(err)
 	}
 }
 
 func (st *HandleT) readErrJobsLoop(ctx context.Context) {
 	st.logger.Info("Processor errors stash loop started")
-
+	var sleepTime time.Duration
 	for {
 		select {
 		case <-ctx.Done():
 			close(st.errProcessQ)
 			return
-		case <-time.After(errReadLoopSleep):
+		case <-time.After(sleepTime):
 			start := time.Now()
-
+			var combinedList []*jobsdb.JobT
+			var limitReached bool
 			// NOTE: sending custom val filters array of size 1 to take advantage of cache in jobsdb.
-			queryParams := jobsdb.GetQueryParamsT{
+			queryParams := jobsdb.GetQueryParams{
 				CustomValFilters:              []string{""},
 				IgnoreCustomValFiltersInQuery: true,
-				JobsLimit:                     errDBReadBatchSize,
-				PayloadSizeLimit:              payloadLimit,
+				JobsLimit:                     st.config.errDBReadBatchSize.Load(),
+				PayloadSizeLimit:              st.adaptiveLimit(st.config.payloadLimit.Load()),
 			}
-			toRetry, err := misc.QueryWithRetriesAndNotify(ctx, st.jobdDBQueryRequestTimeout, st.jobdDBMaxRetries, func(ctx context.Context) (jobsdb.JobsResult, error) {
-				return st.errorDB.GetToRetry(ctx, queryParams)
-			}, sendQueryRetryStats)
+
+			toProcess, err := misc.QueryWithRetriesAndNotify(ctx, st.config.jobdDBQueryRequestTimeout.Load(), st.config.jobdDBMaxRetries.Load(), func(ctx context.Context) (jobsdb.JobsResult, error) {
+				return st.errorDB.GetJobs(ctx, []string{jobsdb.Failed.State, jobsdb.Unprocessed.State}, queryParams)
+			}, st.sendQueryRetryStats)
 			if err != nil {
+				if ctx.Err() != nil { // we are shutting down
+					close(st.errProcessQ)
+					return //nolint:nilerr
+				}
 				st.logger.Errorf("Error occurred while reading proc error jobs. Err: %v", err)
 				panic(err)
 			}
 
-			combinedList := toRetry.Jobs
-			if !toRetry.LimitsReached {
-				queryParams.JobsLimit -= len(toRetry.Jobs)
-				if queryParams.PayloadSizeLimit > 0 {
-					queryParams.PayloadSizeLimit -= toRetry.PayloadSize
-				}
-				unprocessed, err := misc.QueryWithRetriesAndNotify(ctx, st.jobdDBQueryRequestTimeout, st.jobdDBMaxRetries, func(ctx context.Context) (jobsdb.JobsResult, error) {
-					return st.errorDB.GetUnprocessed(ctx, queryParams)
-				}, sendQueryRetryStats)
-				if err != nil {
-					st.logger.Errorf("Error occurred while reading proc error jobs. Err: %v", err)
-					panic(err)
-				}
-				combinedList = append(combinedList, unprocessed.Jobs...)
-			}
+			combinedList = toProcess.Jobs
+			limitReached = toProcess.LimitsReached
 
 			st.statErrDBR.Since(start)
 
 			if len(combinedList) == 0 {
 				st.logger.Debug("[Processor: readErrJobsLoop]: DB Read Complete. No proc_err Jobs to process")
+				sleepTime = st.calculateSleepTime(limitReached)
 				continue
 			}
 
-			canUpload := backupEnabled()
+			canUpload := st.backupEnabled(st.errorDB)
 
 			jobState := jobsdb.Executing.State
 
@@ -360,6 +360,7 @@ func (st *HandleT) readErrJobsLoop(ctx context.Context) {
 					ErrorCode:     "",
 					ErrorResponse: []byte(`{}`),
 					Parameters:    []byte(`{}`),
+					JobParameters: job.Parameters,
 					WorkspaceId:   job.WorkspaceId,
 				}
 
@@ -373,17 +374,27 @@ func (st *HandleT) readErrJobsLoop(ctx context.Context) {
 				}
 				statusList = append(statusList, &status)
 			}
-			err = misc.RetryWithNotify(context.Background(), st.jobsDBCommandTimeout, st.jobdDBMaxRetries, func(ctx context.Context) error {
+			if err := misc.RetryWithNotify(context.Background(), st.config.jobsDBCommandTimeout.Load(), st.config.jobdDBMaxRetries.Load(), func(ctx context.Context) error {
 				return st.errorDB.UpdateJobStatus(ctx, statusList, nil, nil)
-			}, sendRetryUpdateStats)
-			if err != nil {
-				pkgLogger.Errorf("Error occurred while marking proc error jobs statuses as %v. Panicking. Err: %v", jobState, err)
+			}, st.sendRetryUpdateStats); err != nil {
+				if ctx.Err() != nil { // we are shutting down
+					return //nolint:nilerr
+				}
+				st.logger.Errorf("Error occurred while marking proc error jobs statuses as %v. Panicking. Err: %v", jobState, err)
 				panic(err)
 			}
 
 			if canUpload && len(filteredJobList) > 0 {
 				st.errProcessQ <- filteredJobList
 			}
+			sleepTime = st.calculateSleepTime(limitReached)
 		}
 	}
+}
+
+func (*HandleT) calculateSleepTime(limitReached bool) time.Duration {
+	if limitReached {
+		return time.Duration(0)
+	}
+	return config.GetDuration("Processor.errReadLoopSleep", 30, time.Second)
 }

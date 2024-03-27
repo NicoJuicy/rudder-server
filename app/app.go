@@ -10,15 +10,15 @@ import (
 	"runtime/pprof"
 	"strings"
 
-	"github.com/rudderlabs/rudder-server/config"
-	backendconfig "github.com/rudderlabs/rudder-server/config/backend-config"
+	"github.com/rudderlabs/rudder-go-kit/config"
+	"github.com/rudderlabs/rudder-go-kit/logger"
+	backendconfig "github.com/rudderlabs/rudder-server/backend-config"
 	configenv "github.com/rudderlabs/rudder-server/enterprise/config-env"
 	"github.com/rudderlabs/rudder-server/enterprise/replay"
 	"github.com/rudderlabs/rudder-server/enterprise/reporting"
 	suppression "github.com/rudderlabs/rudder-server/enterprise/suppress-user"
 	"github.com/rudderlabs/rudder-server/jobsdb"
 	"github.com/rudderlabs/rudder-server/services/db"
-	"github.com/rudderlabs/rudder-server/utils/logger"
 )
 
 const (
@@ -138,14 +138,21 @@ func New(options *Options) App {
 // LivenessHandler is the http handler for the Kubernetes liveness probe
 func LivenessHandler(jobsDB jobsdb.JobsDB) http.HandlerFunc {
 	return func(w http.ResponseWriter, _ *http.Request) {
-		_, _ = w.Write([]byte(getHealthVal(jobsDB)))
+		healthy, responsePayload := getHealthVal(jobsDB)
+		if !healthy {
+			http.Error(w, "Cannot connect to db", http.StatusServiceUnavailable)
+			return
+		}
+		_, _ = w.Write([]byte(responsePayload))
 	}
 }
 
-func getHealthVal(jobsDB jobsdb.JobsDB) string {
+func getHealthVal(jobsDB jobsdb.JobsDB) (bool, string) {
 	dbService := "UP"
+	healthy := true
 	if jobsDB.Ping() != nil {
 		dbService = "DOWN"
+		healthy = false
 	}
 	enabledRouter := "TRUE"
 	if !config.GetBool("enableRouter", true) {
@@ -157,7 +164,7 @@ func getHealthVal(jobsDB jobsdb.JobsDB) string {
 	}
 
 	appTypeStr := strings.ToUpper(config.GetString("APP_TYPE", EMBEDDED))
-	return fmt.Sprintf(
+	return healthy, fmt.Sprintf(
 		`{"appType":"%s","server":"UP","db":"%s","acceptingEvents":"TRUE","routingEvents":"%s","mode":"%s",`+
 			`"backendConfigMode":"%s","lastSync":"%s","lastRegulationSync":"%s"}`,
 		appTypeStr, dbService, enabledRouter, strings.ToUpper(db.CurrentMode),

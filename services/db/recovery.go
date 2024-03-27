@@ -7,11 +7,11 @@ import (
 	"sort"
 	"time"
 
+	"github.com/rudderlabs/rudder-go-kit/stats"
 	"github.com/rudderlabs/rudder-server/services/alert"
-	"github.com/rudderlabs/rudder-server/services/stats"
 
-	"github.com/rudderlabs/rudder-server/config"
-	"github.com/rudderlabs/rudder-server/utils/logger"
+	"github.com/rudderlabs/rudder-go-kit/config"
+	"github.com/rudderlabs/rudder-go-kit/logger"
 )
 
 const (
@@ -42,7 +42,7 @@ type RecoveryDataT struct {
 var pkgLogger logger.Logger
 
 func Init() {
-	config.RegisterStringConfigVariable("/tmp/recovery_data.json", &storagePath, false, "recovery.storagePath")
+	storagePath = config.GetStringVar("/tmp/recovery_data.json", "recovery.storagePath")
 	pkgLogger = logger.NewLogger().Child("db").Child("recovery")
 }
 

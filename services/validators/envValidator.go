@@ -9,9 +9,9 @@ import (
 	"strconv"
 	"time"
 
-	"github.com/rudderlabs/rudder-server/config"
+	"github.com/rudderlabs/rudder-go-kit/config"
+	"github.com/rudderlabs/rudder-go-kit/logger"
 	migrator "github.com/rudderlabs/rudder-server/services/sql-migrator"
-	"github.com/rudderlabs/rudder-server/utils/logger"
 	"github.com/rudderlabs/rudder-server/utils/misc"
 )
 
@@ -124,7 +124,7 @@ func getWorkspaceFromDB(dbHandle *sql.DB) (string, error) {
 }
 
 func createDBConnection() (*sql.DB, error) {
-	psqlInfo := misc.GetConnectionString()
+	psqlInfo := misc.GetConnectionString(config.Default, "env-validator")
 	var err error
 	dbHandle, err := sql.Open("postgres", psqlInfo)
 	if err != nil {
@@ -150,10 +150,10 @@ func killDanglingDBConnections(db *sql.DB) error {
 	rows, err := db.Query(`SELECT PID, QUERY_START, COALESCE(WAIT_EVENT_TYPE,''), COALESCE(WAIT_EVENT, ''), COALESCE(STATE, ''), QUERY, PG_TERMINATE_BACKEND(PID)
 							FROM PG_STAT_ACTIVITY
 							WHERE PID <> PG_BACKEND_PID()
-							AND APPLICATION_NAME = CURRENT_SETTING('APPLICATION_NAME')
+							AND APPLICATION_NAME LIKE ('%' || CURRENT_SETTING('APPLICATION_NAME'))
 							AND APPLICATION_NAME <> ''`)
 	if err != nil {
-		return fmt.Errorf("error occurred when querying pg_stat_activity table for terminating dangling connections: %w", err)
+		return fmt.Errorf("querying pg_stat_activity table for terminating dangling connections: %w", err)
 	}
 	defer func() { _ = rows.Close() }()
 
@@ -172,9 +172,12 @@ func killDanglingDBConnections(db *sql.DB) error {
 		var row danglingConnRow
 		err := rows.Scan(&row.pid, &row.queryStart, &row.waitEventType, &row.waitEvent, &row.state, &row.query, &row.terminated)
 		if err != nil {
-			return fmt.Errorf("error occurred when scanning pg_stat_activity table for terminating dangling connections: %w", err)
+			return fmt.Errorf("scanning pg_stat_activity table for terminating dangling connections: %w", err)
 		}
 		dangling = append(dangling, &row)
+	}
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("iterating pg_stat_activity table for terminating dangling connections: %w", err)
 	}
 
 	if len(dangling) > 0 {
@@ -271,7 +274,7 @@ func CheckAndValidateWorkspaceToken() error {
 	pkgLogger.Warn("Previous workspace token is not same as the current workspace token. Parking current jobsdb aside and creating a new one")
 
 	dbName := config.GetString("DB.name", "ubuntu")
-	misc.ReplaceDB(dbName, dbName+"_"+strconv.FormatInt(time.Now().Unix(), 10)+"_"+workspaceTokenHashInDB)
+	misc.ReplaceDB(dbName, dbName+"_"+strconv.FormatInt(time.Now().Unix(), 10)+"_"+workspaceTokenHashInDB, config.Default)
 
 	dbHandle, err = createDBConnection()
 	if err != nil {

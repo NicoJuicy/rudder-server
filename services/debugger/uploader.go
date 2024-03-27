@@ -6,14 +6,17 @@ import (
 	"bytes"
 	"context"
 	"net/http"
+	"path"
+	"strconv"
 	"sync"
 	"time"
 
-	"github.com/rudderlabs/rudder-server/config"
+	"github.com/rudderlabs/rudder-go-kit/config"
+	"github.com/rudderlabs/rudder-go-kit/logger"
+	"github.com/rudderlabs/rudder-go-kit/stats"
 	"github.com/rudderlabs/rudder-server/rruntime"
-	"github.com/rudderlabs/rudder-server/services/stats"
 	"github.com/rudderlabs/rudder-server/utils/httputil"
-	"github.com/rudderlabs/rudder-server/utils/logger"
+	"github.com/rudderlabs/rudder-server/utils/misc"
 	"github.com/rudderlabs/rudder-server/utils/sysUtils"
 )
 
@@ -42,9 +45,8 @@ type uploaderImpl[E any] struct {
 	eventBufferLock                        sync.RWMutex
 	eventBuffer                            []E
 	Client                                 sysUtils.HTTPClientI
-	maxBatchSize, maxRetry, maxESQueueSize int
-	batchTimeout, retrySleep               time.Duration
-	timingStat                             stats.Measurement
+	maxBatchSize, maxRetry, maxESQueueSize misc.ValueLoader[int]
+	batchTimeout, retrySleep               misc.ValueLoader[time.Duration]
 	region                                 string
 
 	bgWaitGroup sync.WaitGroup
@@ -56,13 +58,12 @@ func init() {
 
 func (uploader *uploaderImpl[E]) Setup() {
 	// Number of events that are batched before sending events to control plane
-	config.RegisterIntConfigVariable(32, &uploader.maxBatchSize, true, 1, "Debugger.maxBatchSize")
-	config.RegisterIntConfigVariable(256, &uploader.maxESQueueSize, true, 1, "Debugger.maxESQueueSize")
-	config.RegisterIntConfigVariable(3, &uploader.maxRetry, true, 1, "Debugger.maxRetry")
-	config.RegisterDurationConfigVariable(2, &uploader.batchTimeout, true, time.Second, "Debugger.batchTimeoutInS")
-	config.RegisterDurationConfigVariable(100, &uploader.retrySleep, true, time.Millisecond, "Debugger.retrySleepInMS")
+	uploader.maxBatchSize = config.GetReloadableIntVar(32, 1, "Debugger.maxBatchSize")
+	uploader.maxESQueueSize = config.GetReloadableIntVar(256, 1, "Debugger.maxESQueueSize")
+	uploader.maxRetry = config.GetReloadableIntVar(3, 1, "Debugger.maxRetry")
+	uploader.batchTimeout = config.GetReloadableDurationVar(2, time.Second, "Debugger.batchTimeoutInS")
+	uploader.retrySleep = config.GetReloadableDurationVar(100, time.Millisecond, "Debugger.retrySleepInMS")
 	uploader.region = config.GetString("region", "")
-	uploader.timingStat = stats.Default.NewStat("debugger_upload", stats.TimerType)
 }
 
 func New[E any](url string, transformer Transformer[E]) Uploader[E] {
@@ -115,6 +116,7 @@ func (uploader *uploaderImpl[E]) uploadEvents(eventBuffer []E) {
 	for {
 		var resp *http.Response
 		startTime := time.Now()
+		resource := path.Base(url)
 		req, err := Http.NewRequest("POST", url, bytes.NewBuffer(rawJSON))
 		if err != nil {
 			pkgLogger.Errorf("[Uploader] Failed to create new http request. Err: %v", err)
@@ -129,18 +131,26 @@ func (uploader *uploaderImpl[E]) uploadEvents(eventBuffer []E) {
 		req.SetBasicAuth(config.GetWorkspaceToken(), "")
 
 		resp, err = uploader.Client.Do(req)
-		uploader.timingStat.SendTiming(time.Since(startTime))
 		if err != nil {
 			pkgLogger.Error("Config Backend connection error", err)
-			if retryCount >= uploader.maxRetry {
+			stats.Default.NewTaggedStat("debugger_http_errors", stats.CountType, map[string]string{
+				"resource": resource,
+			}).Increment()
+			if retryCount >= uploader.maxRetry.Load() {
 				pkgLogger.Errorf("Max retries exceeded trying to connect to config backend")
 				return
 			}
 			retryCount++
-			time.Sleep(uploader.retrySleep)
+			time.Sleep(uploader.retrySleep.Load())
 			// Refresh the connection
 			continue
 		}
+
+		stats.Default.NewTaggedStat("debugger_http_requests", stats.TimerType, stats.Tags{
+			"responseCode": strconv.Itoa(resp.StatusCode),
+			"resource":     resource,
+		}).Since(startTime)
+
 		func() { httputil.CloseResponse(resp) }()
 		if resp.StatusCode != http.StatusOK {
 			pkgLogger.Errorf("[Uploader] Response Error from Config Backend: Status: %v, Body: %v ", resp.StatusCode, resp.Body)
@@ -154,7 +164,7 @@ func (uploader *uploaderImpl[E]) handleEvents() {
 		uploader.eventBufferLock.Lock()
 
 		// If eventBuffer size is more than maxESQueueSize, Delete oldest.
-		if len(uploader.eventBuffer) >= uploader.maxESQueueSize {
+		if len(uploader.eventBuffer) >= uploader.maxESQueueSize.Load() {
 			var z E
 			uploader.eventBuffer[0] = z
 			uploader.eventBuffer = uploader.eventBuffer[1:]
@@ -171,15 +181,15 @@ func (uploader *uploaderImpl[E]) flushEvents(ctx context.Context) {
 	for {
 		select {
 		case <-ctx.Done():
-		case <-time.After(uploader.batchTimeout):
+		case <-time.After(uploader.batchTimeout.Load()):
 		}
 		uploader.eventBufferLock.Lock()
 
 		flushSize := len(uploader.eventBuffer)
 		var flushEvents []E
 
-		if flushSize > uploader.maxBatchSize {
-			flushSize = uploader.maxBatchSize
+		if flushSize > uploader.maxBatchSize.Load() {
+			flushSize = uploader.maxBatchSize.Load()
 		}
 
 		if flushSize > 0 {

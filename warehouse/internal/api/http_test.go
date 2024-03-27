@@ -13,12 +13,18 @@ import (
 	"testing"
 	"time"
 
-	"github.com/rudderlabs/rudder-server/services/stats"
-	"github.com/rudderlabs/rudder-server/utils/logger"
+	"github.com/rudderlabs/rudder-go-kit/stats"
+
+	backendconfig "github.com/rudderlabs/rudder-server/backend-config"
+
+	"github.com/stretchr/testify/require"
+
+	"github.com/rudderlabs/rudder-go-kit/config"
+
+	"github.com/rudderlabs/rudder-go-kit/logger"
 	"github.com/rudderlabs/rudder-server/warehouse/internal/api"
 	"github.com/rudderlabs/rudder-server/warehouse/internal/model"
 	"github.com/rudderlabs/rudder-server/warehouse/multitenant"
-	"github.com/stretchr/testify/require"
 )
 
 type memRepo struct {
@@ -71,8 +77,6 @@ func TestAPI_Process(t *testing.T) {
 			DestinationRevisionID: "2H1cLBvL3v0prRBNzpe8D34XTzU",
 			TotalEvents:           2,
 			TotalBytes:            2000,
-			SourceBatchID:         "<source-batch-id>",
-			SourceTaskID:          "<source-task-id>",
 			SourceTaskRunID:       "<source-task-run-id>",
 			SourceJobID:           "<source-job-id>",
 			SourceJobRunID:        "<source-job-run-id>",
@@ -116,13 +120,13 @@ func TestAPI_Process(t *testing.T) {
 			degradedWorkspaceIDs: []string{"279L3V7FSpx43LaNJ0nIs9KRaNC"},
 
 			respCode: http.StatusServiceUnavailable,
-			respBody: "Workspace is degraded\n",
+			respBody: "workspace is degraded\n",
 		},
 		{
 			name: "invalid request body missing",
 
 			respCode: http.StatusBadRequest,
-			respBody: "can't unmarshal body\n",
+			respBody: "invalid JSON in request body\n",
 		},
 		{
 			name:    "invalid request workspace id missing",
@@ -167,14 +171,15 @@ func TestAPI_Process(t *testing.T) {
 				err: tc.storeErr,
 			}
 
-			m := &multitenant.Manager{
-				DegradedWorkspaceIDs: tc.degradedWorkspaceIDs,
-			}
+			c := config.New()
+			c.Set("Warehouse.degradedWorkspaceIDs", tc.degradedWorkspaceIDs)
+
+			m := multitenant.New(c, backendconfig.DefaultBackendConfig)
 
 			wAPI := api.WarehouseAPI{
 				Repo:        r,
 				Logger:      logger.NOP,
-				Stats:       stats.Default, // TODO: use a NOP stats
+				Stats:       stats.NOP,
 				Multitenant: m,
 			}
 

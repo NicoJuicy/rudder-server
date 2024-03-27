@@ -1,5 +1,3 @@
-//go:build !warehouse_integration
-
 package loadfiles_test
 
 import (
@@ -8,12 +6,13 @@ import (
 	"testing"
 	"time"
 
-	backendconfig "github.com/rudderlabs/rudder-server/config/backend-config"
-	"github.com/rudderlabs/rudder-server/utils/logger"
+	"github.com/stretchr/testify/require"
+
+	"github.com/rudderlabs/rudder-go-kit/logger"
+	backendconfig "github.com/rudderlabs/rudder-server/backend-config"
 	"github.com/rudderlabs/rudder-server/warehouse/internal/loadfiles"
 	"github.com/rudderlabs/rudder-server/warehouse/internal/model"
 	warehouseutils "github.com/rudderlabs/rudder-server/warehouse/utils"
-	"github.com/stretchr/testify/require"
 )
 
 type mockControlPlaneClient struct {
@@ -49,7 +48,7 @@ func getStagingFiles() []*model.StagingFile {
 
 func TestCreateLoadFiles(t *testing.T) {
 	t.Parallel()
-	notifer := &mockNotifier{
+	notifier := &mockNotifier{
 		t:      t,
 		tables: []string{"track", "indentify"},
 	}
@@ -59,7 +58,7 @@ func TestCreateLoadFiles(t *testing.T) {
 
 	lf := loadfiles.LoadFileGenerator{
 		Logger:    logger.NOP,
-		Notifier:  notifer,
+		Notifier:  notifier,
 		StageRepo: stageRepo,
 		LoadRepo:  loadRepo,
 
@@ -71,7 +70,7 @@ func TestCreateLoadFiles(t *testing.T) {
 	stagingFiles := getStagingFiles()
 
 	job := model.UploadJob{
-		Warehouse: warehouseutils.Warehouse{
+		Warehouse: model.Warehouse{
 			WorkspaceID: "",
 			Source:      backendconfig.SourceT{},
 			Destination: backendconfig.DestinationT{
@@ -91,12 +90,12 @@ func TestCreateLoadFiles(t *testing.T) {
 		StagingFiles: stagingFiles,
 	}
 
-	startID, endID, err := lf.CreateLoadFiles(ctx, job)
+	startID, endID, err := lf.CreateLoadFiles(ctx, &job)
 	require.NoError(t, err)
 	require.Equal(t, int64(1), startID)
 	require.Equal(t, int64(20), endID)
 
-	require.Len(t, loadRepo.store, len(stagingFiles)*len(notifer.tables))
+	require.Len(t, loadRepo.store, len(stagingFiles)*len(notifier.tables))
 	require.Len(t, stageRepo.store, len(stagingFiles))
 
 	for _, stagingFile := range stagingFiles {
@@ -115,7 +114,7 @@ func TestCreateLoadFiles(t *testing.T) {
 
 			tableNames = append(tableNames, loadFile.TableName)
 		}
-		require.ElementsMatch(t, notifer.tables, tableNames)
+		require.ElementsMatch(t, notifier.tables, tableNames)
 		require.Equal(t, warehouseutils.StagingFileSucceededState, stageRepo.store[stagingFile.ID].Status)
 	}
 
@@ -126,12 +125,12 @@ func TestCreateLoadFiles(t *testing.T) {
 		}
 		stagingFiles[0].Status = warehouseutils.StagingFileFailedState
 
-		startID, endID, err := lf.CreateLoadFiles(ctx, job)
+		startID, endID, err := lf.CreateLoadFiles(ctx, &job)
 		require.NoError(t, err)
 		require.Equal(t, int64(21), startID)
 		require.Equal(t, int64(22), endID)
 
-		require.Len(t, loadRepo.store, len(stagingFiles)*len(notifer.tables))
+		require.Len(t, loadRepo.store, len(stagingFiles)*len(notifier.tables))
 	})
 
 	t.Run("force recreate", func(t *testing.T) {
@@ -139,12 +138,12 @@ func TestCreateLoadFiles(t *testing.T) {
 			stagingFile.Status = warehouseutils.StagingFileSucceededState
 		}
 
-		startID, endID, err := lf.ForceCreateLoadFiles(ctx, job)
+		startID, endID, err := lf.ForceCreateLoadFiles(ctx, &job)
 		require.NoError(t, err)
 		require.Equal(t, int64(23), startID)
 		require.Equal(t, int64(42), endID)
 
-		require.Len(t, loadRepo.store, len(stagingFiles)*len(notifer.tables))
+		require.Len(t, loadRepo.store, len(stagingFiles)*len(notifier.tables))
 		require.Len(t, stageRepo.store, len(stagingFiles))
 	})
 }
@@ -154,7 +153,7 @@ func TestCreateLoadFiles_Failure(t *testing.T) {
 
 	tables := []string{"track", "indentify"}
 
-	warehouse := warehouseutils.Warehouse{
+	warehouse := model.Warehouse{
 		WorkspaceID: "",
 		Source:      backendconfig.SourceT{},
 		Destination: backendconfig.DestinationT{
@@ -198,7 +197,7 @@ func TestCreateLoadFiles_Failure(t *testing.T) {
 		t.Log("empty location should cause worker failure")
 		stagingFiles[0].Location = ""
 
-		startID, endID, err := lf.CreateLoadFiles(ctx, model.UploadJob{
+		startID, endID, err := lf.CreateLoadFiles(ctx, &model.UploadJob{
 			Warehouse:    warehouse,
 			Upload:       upload,
 			StagingFiles: stagingFiles,
@@ -242,7 +241,7 @@ func TestCreateLoadFiles_Failure(t *testing.T) {
 			stagingFiles[i].Location = ""
 		}
 
-		startID, endID, err := lf.CreateLoadFiles(ctx, model.UploadJob{
+		startID, endID, err := lf.CreateLoadFiles(ctx, &model.UploadJob{
 			Warehouse:    warehouse,
 			Upload:       upload,
 			StagingFiles: stagingFiles,
@@ -301,7 +300,7 @@ func TestCreateLoadFiles_DestinationHistory(t *testing.T) {
 	}
 
 	job := model.UploadJob{
-		Warehouse: warehouseutils.Warehouse{
+		Warehouse: model.Warehouse{
 			WorkspaceID: "",
 			Source:      backendconfig.SourceT{},
 			Destination: backendconfig.DestinationT{
@@ -323,7 +322,7 @@ func TestCreateLoadFiles_DestinationHistory(t *testing.T) {
 		},
 	}
 
-	startID, endID, err := lf.CreateLoadFiles(ctx, job)
+	startID, endID, err := lf.CreateLoadFiles(ctx, &job)
 	require.NoError(t, err)
 	require.Equal(t, int64(1), startID)
 	require.Equal(t, int64(2), endID)
@@ -354,9 +353,125 @@ func TestCreateLoadFiles_DestinationHistory(t *testing.T) {
 	t.Run("invalid revision ID", func(t *testing.T) {
 		stagingFile.DestinationRevisionID = "invalid_revision_id"
 
-		startID, endID, err := lf.CreateLoadFiles(ctx, job)
+		startID, endID, err := lf.CreateLoadFiles(ctx, &job)
 		require.EqualError(t, err, "populating destination revision ID: revision \"invalid_revision_id\" not found")
 		require.Zero(t, startID)
 		require.Zero(t, endID)
 	})
+}
+
+func TestGetLoadFilePrefix(t *testing.T) {
+	testCases := []struct {
+		name      string
+		warehouse model.Warehouse
+		expected  string
+	}{
+		{
+			name: "s3 datalake",
+			warehouse: model.Warehouse{
+				Destination: backendconfig.DestinationT{
+					Config: map[string]interface{}{},
+				},
+				Type: warehouseutils.S3Datalake,
+			},
+			expected: "2022/08/06/14",
+		},
+		{
+			name: "s3 datalake with glue",
+			warehouse: model.Warehouse{
+				Destination: backendconfig.DestinationT{
+					Config: map[string]interface{}{
+						"region":  "test-region",
+						"useGlue": true,
+					},
+				},
+				Type: warehouseutils.S3Datalake,
+			},
+			expected: "2022/08/06/14",
+		},
+		{
+			name: "s3 datalake with glue and layout",
+			warehouse: model.Warehouse{
+				Destination: backendconfig.DestinationT{
+					Config: map[string]interface{}{
+						"region":           "test-region",
+						"useGlue":          true,
+						"timeWindowLayout": "dt=2006-01-02",
+					},
+				},
+				Type: warehouseutils.S3Datalake,
+			},
+			expected: "dt=2022-08-06",
+		},
+		{
+			name: "azure datalake",
+			warehouse: model.Warehouse{
+				Destination: backendconfig.DestinationT{
+					Config: map[string]interface{}{
+						"tableSuffix": "key=val",
+					},
+				},
+				Type: warehouseutils.AzureDatalake,
+			},
+			expected: "2022/08/06/14",
+		},
+		{
+			name: "gcs datalake",
+			warehouse: model.Warehouse{
+				Destination: backendconfig.DestinationT{
+					Config: map[string]interface{}{},
+				},
+				Type: warehouseutils.GCSDatalake,
+			},
+			expected: "2022/08/06/14",
+		},
+		{
+			name: "gcs datalake with suffix",
+			warehouse: model.Warehouse{
+				Destination: backendconfig.DestinationT{
+					Config: map[string]interface{}{
+						"tableSuffix": "key=val",
+					},
+				},
+				Type: warehouseutils.GCSDatalake,
+			},
+			expected: "key=val/2022/08/06/14",
+		},
+		{
+			name: "gcs datalake with layout",
+			warehouse: model.Warehouse{
+				Destination: backendconfig.DestinationT{
+					Config: map[string]interface{}{
+						"timeWindowLayout": "year=2006/month=01/day=02/hour=15",
+					},
+				},
+				Type: warehouseutils.GCSDatalake,
+			},
+			expected: "year=2022/month=08/day=06/hour=14",
+		},
+		{
+			name: "gcs datalake with suffix and layout",
+			warehouse: model.Warehouse{
+				Destination: backendconfig.DestinationT{
+					Config: map[string]interface{}{
+						"tableSuffix":      "key=val",
+						"timeWindowLayout": "year=2006/month=01/day=02/hour=15",
+					},
+				},
+				Type: warehouseutils.GCSDatalake,
+			},
+			expected: "key=val/year=2022/month=08/day=06/hour=14",
+		},
+	}
+	for _, tc := range testCases {
+		tc := tc
+
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			timeWindow := time.Date(2022, time.Month(8), 6, 14, 10, 30, 0, time.UTC)
+			got := loadfiles.GetLoadFilePrefix(timeWindow, tc.warehouse)
+			require.Equal(t, got, tc.expected)
+		})
+	}
 }

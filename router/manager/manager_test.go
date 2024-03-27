@@ -8,7 +8,7 @@ import (
 	"log"
 	"os"
 	"os/signal"
-	"sync"
+	"sync/atomic"
 	"syscall"
 	"testing"
 	"time"
@@ -19,20 +19,19 @@ import (
 	"github.com/ory/dockertest/v3"
 	"github.com/stretchr/testify/require"
 
+	"github.com/rudderlabs/rudder-go-kit/config"
+	"github.com/rudderlabs/rudder-go-kit/logger"
 	"github.com/rudderlabs/rudder-server/admin"
-	"github.com/rudderlabs/rudder-server/config"
-	backendconfig "github.com/rudderlabs/rudder-server/config/backend-config"
+	backendconfig "github.com/rudderlabs/rudder-server/backend-config"
 	"github.com/rudderlabs/rudder-server/enterprise/reporting"
 	"github.com/rudderlabs/rudder-server/jobsdb"
-	mocksBackendConfig "github.com/rudderlabs/rudder-server/mocks/config/backend-config"
-	mock_tenantstats "github.com/rudderlabs/rudder-server/mocks/services/multitenant"
-	"github.com/rudderlabs/rudder-server/processor/stash"
+	mocksBackendConfig "github.com/rudderlabs/rudder-server/mocks/backend-config"
 	"github.com/rudderlabs/rudder-server/router"
 	"github.com/rudderlabs/rudder-server/router/batchrouter"
-	"github.com/rudderlabs/rudder-server/services/archiver"
+	"github.com/rudderlabs/rudder-server/router/throttler"
 	"github.com/rudderlabs/rudder-server/services/rsources"
+	"github.com/rudderlabs/rudder-server/services/transformer"
 	"github.com/rudderlabs/rudder-server/services/transientsource"
-	"github.com/rudderlabs/rudder-server/utils/logger"
 	"github.com/rudderlabs/rudder-server/utils/pubsub"
 	testutils "github.com/rudderlabs/rudder-server/utils/tests"
 )
@@ -162,31 +161,20 @@ var (
 func initRouter() {
 	config.Reset()
 	logger.Reset()
-	stash.Init()
 	admin.Init()
-	jobsdb.Init()
-	jobsdb.Init2()
-	jobsdb.Init3()
-	archiver.Init()
-	router.Init()
-	router.InitRouterAdmin()
-	batchrouter.Init()
-	batchrouter.Init2()
 }
 
 func TestRouterManager(t *testing.T) {
 	RegisterTestingT(t)
 	initRouter()
-	pkgLogger = logger.NewLogger().Child("router")
-	c := make(chan bool)
-	once := sync.Once{}
+	config.Set("Router.isolationMode", "none")
+	defer config.Reset()
 
 	asyncHelper := testutils.AsyncTestHelper{}
 	asyncHelper.Setup()
 	mockCtrl := gomock.NewController(t)
 	mockBackendConfig := mocksBackendConfig.NewMockBackendConfig(mockCtrl)
 	mockRsourcesService := rsources.NewMockJobService(mockCtrl)
-	mockMTI := mock_tenantstats.NewMockMultiTenantI(mockCtrl)
 
 	mockBackendConfig.EXPECT().Subscribe(gomock.Any(), backendconfig.TopicBackendConfig).DoAndReturn(func(
 		ctx context.Context, topic backendconfig.Topic,
@@ -202,52 +190,57 @@ func TestRouterManager(t *testing.T) {
 		return ch
 	}).AnyTimes()
 	mockBackendConfig.EXPECT().AccessToken().AnyTimes()
-	mockMTI.EXPECT().UpdateWorkspaceLatencyMap(gomock.Any(), gomock.Any(), gomock.Any()).AnyTimes()
-	mockMTI.EXPECT().GetRouterPickupJobs(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Do(
-		func(destType string, noOfWorkers int, routerTimeOut time.Duration, jobQueryBatchSize int) {
-			once.Do(func() {
-				close(c)
-			})
-		}).AnyTimes()
 
 	rtDB := jobsdb.NewForReadWrite("rt")
+	mockRtDB := &mockJobsDB{JobsDB: rtDB}
 	brtDB := jobsdb.NewForReadWrite("batch_rt")
 	errDB := jobsdb.NewForReadWrite("proc_error")
 	defer rtDB.Close()
 	defer brtDB.Close()
 	defer errDB.Close()
-	tDb := &jobsdb.MultiTenantHandleT{HandleT: rtDB}
 	rtFactory := &router.Factory{
-		Reporting:        &reporting.NOOP{},
-		Multitenant:      mockMTI,
-		BackendConfig:    mockBackendConfig,
-		RouterDB:         tDb,
-		ProcErrorDB:      errDB,
-		TransientSources: transientsource.NewEmptyService(),
-		RsourcesService:  mockRsourcesService,
+		Logger:                     logger.NOP,
+		Reporting:                  &reporting.NOOP{},
+		BackendConfig:              mockBackendConfig,
+		RouterDB:                   mockRtDB,
+		ProcErrorDB:                errDB,
+		TransientSources:           transientsource.NewEmptyService(),
+		RsourcesService:            mockRsourcesService,
+		ThrottlerFactory:           throttler.NewNoOpThrottlerFactory(),
+		TransformerFeaturesService: transformer.NewNoOpService(),
 	}
 	brtFactory := &batchrouter.Factory{
 		Reporting:        &reporting.NOOP{},
-		Multitenant:      mockMTI,
 		BackendConfig:    mockBackendConfig,
 		RouterDB:         brtDB,
 		ProcErrorDB:      errDB,
 		TransientSources: transientsource.NewEmptyService(),
 		RsourcesService:  mockRsourcesService,
 	}
-	r := New(rtFactory, brtFactory, mockBackendConfig)
+	r := New(rtFactory, brtFactory, mockBackendConfig, logger.NewLogger())
 
 	for i := 0; i < 5; i++ {
 		require.NoError(t, rtDB.Start())
 		require.NoError(t, brtDB.Start())
 		require.NoError(t, errDB.Start())
 		require.NoError(t, r.Start())
-		<-c
+		require.Eventually(t, func() bool {
+			return mockRtDB.called.Load()
+		}, 5*time.Second, 100*time.Millisecond)
 		r.Stop()
 		rtDB.Stop()
 		brtDB.Stop()
 		errDB.Stop()
-		c = make(chan bool)
-		once = sync.Once{}
+		mockRtDB.called.Store(false)
 	}
+}
+
+type mockJobsDB struct {
+	called atomic.Bool
+	jobsdb.JobsDB
+}
+
+func (m *mockJobsDB) GetToProcess(ctx context.Context, params jobsdb.GetQueryParams, more jobsdb.MoreToken) (*jobsdb.MoreJobsResult, error) {
+	m.called.Store(true)
+	return m.JobsDB.GetToProcess(ctx, params, more)
 }

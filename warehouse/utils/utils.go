@@ -9,8 +9,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
-	"net/http"
 	"net/url"
 	"os"
 	"reflect"
@@ -19,35 +17,38 @@ import (
 	"strings"
 	"time"
 
+	"github.com/samber/lo"
+
+	"github.com/rudderlabs/rudder-server/warehouse/internal/model"
+
 	"github.com/Azure/azure-storage-blob-go/azblob"
 	"github.com/aws/aws-sdk-go/service/s3"
 	"github.com/aws/aws-sdk-go/service/sts"
 	"github.com/iancoleman/strcase"
 	"github.com/tidwall/gjson"
 
-	"github.com/rudderlabs/rudder-server/config"
-	backendconfig "github.com/rudderlabs/rudder-server/config/backend-config"
-	"github.com/rudderlabs/rudder-server/services/filemanager"
-	"github.com/rudderlabs/rudder-server/services/stats"
+	"github.com/rudderlabs/rudder-go-kit/awsutil"
+	"github.com/rudderlabs/rudder-go-kit/config"
+	"github.com/rudderlabs/rudder-go-kit/filemanager"
+	"github.com/rudderlabs/rudder-go-kit/logger"
+	"github.com/rudderlabs/rudder-go-kit/stats"
+	backendconfig "github.com/rudderlabs/rudder-server/backend-config"
 	"github.com/rudderlabs/rudder-server/utils/awsutils"
-	"github.com/rudderlabs/rudder-server/utils/httputil"
-	"github.com/rudderlabs/rudder-server/utils/logger"
 	"github.com/rudderlabs/rudder-server/utils/misc"
-	"github.com/rudderlabs/rudder-server/warehouse/tunnelling"
 )
 
 const (
-	RS             = "RS"
-	BQ             = "BQ"
-	SNOWFLAKE      = "SNOWFLAKE"
-	POSTGRES       = "POSTGRES"
-	CLICKHOUSE     = "CLICKHOUSE"
-	MSSQL          = "MSSQL"
-	AZURE_SYNAPSE  = "AZURE_SYNAPSE"
-	DELTALAKE      = "DELTALAKE"
-	S3_DATALAKE    = "S3_DATALAKE"
-	GCS_DATALAKE   = "GCS_DATALAKE"
-	AZURE_DATALAKE = "AZURE_DATALAKE"
+	RS            = "RS"
+	BQ            = "BQ"
+	SNOWFLAKE     = "SNOWFLAKE"
+	POSTGRES      = "POSTGRES"
+	CLICKHOUSE    = "CLICKHOUSE"
+	MSSQL         = "MSSQL"
+	AzureSynapse  = "AZURE_SYNAPSE"
+	DELTALAKE     = "DELTALAKE"
+	S3Datalake    = "S3_DATALAKE"
+	GCSDatalake   = "GCS_DATALAKE"
+	AzureDatalake = "AZURE_DATALAKE"
 )
 
 const (
@@ -86,20 +87,17 @@ const (
 )
 
 const (
-	BQLoadedAtFormat         = "2006-01-02 15:04:05.999999 Z"
-	BQUuidTSFormat           = "2006-01-02 15:04:05 Z"
 	DatalakeTimeWindowFormat = "2006/01/02/15"
 )
 
 const (
-	CTInvalidStep        = "Invalid step"
 	CTStagingTablePrefix = "setup_test_staging"
 )
 
 const (
-	WAREHOUSE               = "warehouse"
-	RUDDER_MISSING_DATATYPE = "warehouse_rudder_missing_datatype"
-	MISSING_DATATYPE        = "<missing_datatype>"
+	WAREHOUSE             = "warehouse"
+	RudderMissingDatatype = "warehouse_rudder_missing_datatype"
+	MissingDatatype       = "<missing_datatype>"
 )
 
 const (
@@ -108,10 +106,11 @@ const (
 
 // Object storages
 const (
-	S3         = "S3"
-	AZURE_BLOB = "AZURE_BLOB"
-	GCS        = "GCS"
-	MINIO      = "MINIO"
+	S3                 = "S3"
+	AzureBlob          = "AZURE_BLOB"
+	GCS                = "GCS"
+	MINIO              = "MINIO"
+	DigitalOceanSpaces = "DIGITAL_OCEAN_SPACES"
 )
 
 // Cloud providers
@@ -125,44 +124,53 @@ const (
 	AWSAccessKey         = "accessKey"
 	AWSAccessSecret      = "accessKeyID"
 	AWSBucketNameConfig  = "bucketName"
-	AWSRegion            = "region"
 	AWSS3Prefix          = "prefix"
 	MinioAccessKeyID     = "accessKeyID"
 	MinioSecretAccessKey = "secretAccessKey"
 )
 
 var (
-	IdentityEnabledWarehouses []string
-	enableIDResolution        bool
-	AWSCredsExpiryInS         int64
+	pkgLogger          logger.Logger
+	enableIDResolution bool
+	awsCredsExpiryInS  misc.ValueLoader[int64]
+
+	TimeWindowDestinations    = []string{S3Datalake, GCSDatalake, AzureDatalake}
+	WarehouseDestinations     = []string{RS, BQ, SNOWFLAKE, POSTGRES, CLICKHOUSE, MSSQL, AzureSynapse, S3Datalake, GCSDatalake, AzureDatalake, DELTALAKE}
+	IdentityEnabledWarehouses = []string{SNOWFLAKE, BQ}
+	S3PathStyleRegex          = regexp.MustCompile(`https?://s3([.-](?P<region>[^.]+))?.amazonaws\.com/(?P<bucket>[^/]+)/(?P<keyname>.*)`)
+	S3VirtualHostedRegex      = regexp.MustCompile(`https?://(?P<bucket>[^/]+).s3([.-](?P<region>[^.]+))?.amazonaws\.com/(?P<keyname>.*)`)
+
+	WarehouseDestinationMap = lo.SliceToMap(WarehouseDestinations, func(destination string) (string, struct{}) {
+		return destination, struct{}{}
+	})
 )
 
 var WHDestNameMap = map[string]string{
-	BQ:             "bigquery",
-	RS:             "redshift",
-	MSSQL:          "mssql",
-	POSTGRES:       "postgres",
-	SNOWFLAKE:      "snowflake",
-	CLICKHOUSE:     "clickhouse",
-	DELTALAKE:      "deltalake",
-	S3_DATALAKE:    "s3_datalake",
-	GCS_DATALAKE:   "gcs_datalake",
-	AZURE_DATALAKE: "azure_datalake",
-	AZURE_SYNAPSE:  "azure_synapse",
+	BQ:            "bigquery",
+	RS:            "redshift",
+	MSSQL:         "mssql",
+	POSTGRES:      "postgres",
+	SNOWFLAKE:     "snowflake",
+	CLICKHOUSE:    "clickhouse",
+	DELTALAKE:     "deltalake",
+	S3Datalake:    "s3_datalake",
+	GCSDatalake:   "gcs_datalake",
+	AzureDatalake: "azure_datalake",
+	AzureSynapse:  "azure_synapse",
 }
 
 var ObjectStorageMap = map[string]string{
-	RS:             S3,
-	S3_DATALAKE:    S3,
-	BQ:             GCS,
-	GCS_DATALAKE:   GCS,
-	AZURE_DATALAKE: AZURE_BLOB,
+	RS:            S3,
+	S3Datalake:    S3,
+	BQ:            GCS,
+	GCSDatalake:   GCS,
+	AzureDatalake: AzureBlob,
 }
 
 var SnowflakeStorageMap = map[string]string{
 	AWS:   S3,
 	GCP:   GCS,
-	AZURE: AZURE_BLOB,
+	AZURE: AzureBlob,
 }
 
 var DiscardsSchema = map[string]string{
@@ -175,23 +183,9 @@ var DiscardsSchema = map[string]string{
 }
 
 const (
-	LOAD_FILE_TYPE_CSV     = "csv"
-	LOAD_FILE_TYPE_JSON    = "json"
-	LOAD_FILE_TYPE_PARQUET = "parquet"
-	TestConnectionTimeout  = 15 * time.Second
-)
-
-var (
-	pkgLogger              logger.Logger
-	useParquetLoadFilesRS  bool
-	TimeWindowDestinations []string
-	WarehouseDestinations  []string
-	parquetParallelWriters int64
-)
-
-var (
-	S3PathStyleRegex     = regexp.MustCompile(`https?://s3([.-](?P<region>[^.]+))?.amazonaws\.com/(?P<bucket>[^/]+)/(?P<keyname>.*)`)
-	S3VirtualHostedRegex = regexp.MustCompile(`https?://(?P<bucket>[^/]+).s3([.-](?P<region>[^.]+))?.amazonaws\.com/(?P<keyname>.*)`)
+	LoadFileTypeCsv     = "csv"
+	LoadFileTypeJson    = "json"
+	LoadFileTypeParquet = "parquet"
 )
 
 func Init() {
@@ -200,36 +194,21 @@ func Init() {
 }
 
 func loadConfig() {
-	IdentityEnabledWarehouses = []string{SNOWFLAKE, BQ}
-	TimeWindowDestinations = []string{S3_DATALAKE, GCS_DATALAKE, AZURE_DATALAKE}
-	WarehouseDestinations = []string{RS, BQ, SNOWFLAKE, POSTGRES, CLICKHOUSE, MSSQL, AZURE_SYNAPSE, S3_DATALAKE, GCS_DATALAKE, AZURE_DATALAKE, DELTALAKE}
-	config.RegisterBoolConfigVariable(false, &enableIDResolution, false, "Warehouse.enableIDResolution")
-	config.RegisterInt64ConfigVariable(3600, &AWSCredsExpiryInS, true, 1, "Warehouse.awsCredsExpiryInS")
-	config.RegisterIntConfigVariable(10240, &maxStagingFileReadBufferCapacityInK, false, 1, "Warehouse.maxStagingFileReadBufferCapacityInK")
-	config.RegisterBoolConfigVariable(false, &useParquetLoadFilesRS, true, "Warehouse.useParquetLoadFilesRS")
-	config.RegisterInt64ConfigVariable(8, &parquetParallelWriters, true, 1, "Warehouse.parquetParallelWriters")
-}
-
-type Warehouse struct {
-	WorkspaceID string
-	Source      backendconfig.SourceT
-	Destination backendconfig.DestinationT
-	Namespace   string
-	Type        string
-	Identifier  string
+	enableIDResolution = config.GetBoolVar(false, "Warehouse.enableIDResolution")
+	awsCredsExpiryInS = config.GetReloadableInt64Var(3600, 1, "Warehouse.awsCredsExpiryInS")
 }
 
 type DeleteByMetaData struct {
-	JobRunId  string `json:"job_run_id"`
-	TaskRunId string `json:"task_run_id"`
-	StartTime string `json:"start_time"`
+	JobRunId  string    `json:"job_run_id"`
+	TaskRunId string    `json:"task_run_id"`
+	StartTime time.Time `json:"start_time"`
 }
 
 type DeleteByParams struct {
 	SourceId  string
 	JobRunId  string
 	TaskRunId string
-	StartTime string
+	StartTime time.Time
 }
 
 type ColumnInfo struct {
@@ -238,55 +217,44 @@ type ColumnInfo struct {
 	Type  string
 }
 
-func (w *Warehouse) GetBoolDestinationConfig(key string) bool {
-	destConfig := w.Destination.Config
-	if destConfig[key] != nil {
-		if val, ok := destConfig[key].(bool); ok {
-			return val
-		}
-	}
-	return false
-}
-
-type DestinationT struct {
+type Destination struct {
 	Source      backendconfig.SourceT
 	Destination backendconfig.DestinationT
 }
 
-type (
-	SchemaT      map[string]map[string]string
-	TableSchemaT map[string]string
-)
+type Schema model.Schema
 
 type KeyValue struct {
 	Key   string
 	Value interface{}
 }
 
-type UploaderI interface {
-	GetSchemaInWarehouse() SchemaT
-	GetLocalSchema() SchemaT
-	UpdateLocalSchema(schema SchemaT) error
-	GetTableSchemaInWarehouse(tableName string) TableSchemaT
-	GetTableSchemaInUpload(tableName string) TableSchemaT
-	GetLoadFilesMetadata(options GetLoadFilesOptionsT) []LoadFileT
-	GetSampleLoadFileLocation(tableName string) (string, error)
-	GetSingleLoadFile(tableName string) (LoadFileT, error)
+//go:generate mockgen -destination=../internal/mocks/utils/mock_uploader.go -package mock_uploader github.com/rudderlabs/rudder-server/warehouse/utils Uploader
+type Uploader interface {
+	IsWarehouseSchemaEmpty() bool
+	GetLocalSchema(ctx context.Context) (model.Schema, error)
+	UpdateLocalSchema(ctx context.Context, schema model.Schema) error
+	GetTableSchemaInWarehouse(tableName string) model.TableSchema
+	GetTableSchemaInUpload(tableName string) model.TableSchema
+	GetLoadFilesMetadata(ctx context.Context, options GetLoadFilesOptions) ([]LoadFile, error)
+	GetSampleLoadFileLocation(ctx context.Context, tableName string) (string, error)
+	GetSingleLoadFile(ctx context.Context, tableName string) (LoadFile, error)
 	ShouldOnDedupUseNewRecord() bool
 	UseRudderStorage() bool
 	GetLoadFileGenStartTIme() time.Time
 	GetLoadFileType() string
 	GetFirstLastEvent() (time.Time, time.Time)
+	CanAppend() bool
 }
 
-type GetLoadFilesOptionsT struct {
+type GetLoadFilesOptions struct {
 	Table   string
 	StartID int64
 	EndID   int64
 	Limit   int64
 }
 
-type LoadFileT struct {
+type LoadFile struct {
 	Location string
 	Metadata json.RawMessage
 }
@@ -295,12 +263,12 @@ func IDResolutionEnabled() bool {
 	return enableIDResolution
 }
 
-type TableSchemaDiffT struct {
-	Exists                         bool
-	TableToBeCreated               bool
-	ColumnMap                      map[string]string
-	UpdatedSchema                  map[string]string
-	StringColumnsToBeAlteredToText []string
+type TableSchemaDiff struct {
+	Exists           bool
+	TableToBeCreated bool
+	ColumnMap        model.TableSchema
+	UpdatedSchema    model.TableSchema
+	AlteredColumnMap model.TableSchema
 }
 
 type QueryResult struct {
@@ -308,28 +276,16 @@ type QueryResult struct {
 	Values  [][]string
 }
 
-type PendingEventsRequestT struct {
-	SourceID  string `json:"source_id"`
-	TaskRunID string `json:"task_run_id"`
-}
-
-type PendingEventsResponseT struct {
-	PendingEvents            bool  `json:"pending_events"`
-	PendingStagingFilesCount int64 `json:"pending_staging_files"`
-	PendingUploadCount       int64 `json:"pending_uploads"`
-}
-
-type TriggerUploadRequestT struct {
+type SourceIDDestinationID struct {
 	SourceID      string `json:"source_id"`
 	DestinationID string `json:"destination_id"`
 }
 
-type LoadFileWriterI interface {
-	WriteGZ(s string) error
-	Write(p []byte) (int, error)
-	WriteRow(r []interface{}) error
-	Close() error
-	GetLoadFile() *os.File
+type FetchTableInfo struct {
+	SourceID      string   `json:"source_id"`
+	DestinationID string   `json:"destination_id"`
+	Namespace     string   `json:"namespace"`
+	Tables        []string `json:"tables"`
 }
 
 func TimingFromJSONString(str sql.NullString) (status string, recordedTime time.Time) {
@@ -340,57 +296,6 @@ func TimingFromJSONString(str sql.NullString) (status string, recordedTime time.
 	return // zero values
 }
 
-func GetLastFailedStatus(str sql.NullString) (status string) {
-	timingsMap := gjson.Parse(str.String).Array()
-	if len(timingsMap) > 0 {
-		for index := len(timingsMap) - 1; index >= 0; index-- {
-			for s := range timingsMap[index].Map() {
-				if strings.Contains(s, "failed") {
-					return s
-				}
-			}
-		}
-	}
-	return // zero values
-}
-
-func GetLoadFileGenTime(str sql.NullString) (t time.Time) {
-	timingsMap := gjson.Parse(str.String).Array()
-	if len(timingsMap) > 0 {
-		for index := len(timingsMap) - 1; index >= 0; index-- {
-			for s, t := range timingsMap[index].Map() {
-				if strings.Contains(s, "generating_load_files") {
-					return t.Time()
-				}
-			}
-		}
-	}
-	return // zero values
-}
-
-func GetNamespace(source backendconfig.SourceT, destination backendconfig.DestinationT, dbHandle *sql.DB) (namespace string, exists bool) {
-	sqlStatement := fmt.Sprintf(`
-		SELECT
-		  namespace
-		FROM
-		  %s
-		WHERE
-		  source_id = '%s'
-		  AND destination_id = '%s'
-		ORDER BY
-		  id DESC;
-`,
-		WarehouseSchemasTable,
-		source.ID,
-		destination.ID,
-	)
-	err := dbHandle.QueryRow(sqlStatement).Scan(&namespace)
-	if err != nil && err != sql.ErrNoRows {
-		panic(fmt.Errorf("query: %s failed with Error : %w", sqlStatement, err))
-	}
-	return namespace, len(namespace) > 0
-}
-
 // GetObjectFolder returns the folder path for the storage object based on the storage provider
 // eg. For provider as S3: https://test-bucket.s3.amazonaws.com/test-object.csv --> s3://test-bucket/test-object.csv
 func GetObjectFolder(provider, location string) (folder string) {
@@ -398,8 +303,8 @@ func GetObjectFolder(provider, location string) (folder string) {
 	case S3:
 		folder = GetS3LocationFolder(location)
 	case GCS:
-		folder = GetGCSLocationFolder(location, GCSLocationOptionsT{TLDFormat: "gcs"})
-	case AZURE_BLOB:
+		folder = GetGCSLocationFolder(location, GCSLocationOptions{TLDFormat: "gcs"})
+	case AzureBlob:
 		folder = GetAzureBlobLocationFolder(location)
 	}
 	return
@@ -414,8 +319,8 @@ func GetObjectFolderForDeltalake(provider, location string) (folder string) {
 	case S3:
 		folder = GetS3LocationFolder(location)
 	case GCS:
-		folder = GetGCSLocationFolder(location, GCSLocationOptionsT{TLDFormat: "gs"})
-	case AZURE_BLOB:
+		folder = GetGCSLocationFolder(location, GCSLocationOptions{TLDFormat: "gs"})
+	case AzureBlob:
 		blobUrl, _ := url.Parse(location)
 		blobUrlParts := azblob.NewBlobURLParts(*blobUrl)
 		accountName := strings.Replace(blobUrlParts.Host, ".blob.core.windows.net", "", 1)
@@ -426,7 +331,7 @@ func GetObjectFolderForDeltalake(provider, location string) (folder string) {
 	return
 }
 
-func GetColumnsFromTableSchema(schema TableSchemaT) []string {
+func GetColumnsFromTableSchema(schema model.TableSchema) []string {
 	keys := reflect.ValueOf(schema).MapKeys()
 	strKeys := make([]string, len(keys))
 	for i := 0; i < len(keys); i++ {
@@ -442,24 +347,36 @@ func GetObjectLocation(provider, location string) (objectLocation string) {
 	case S3:
 		objectLocation, _ = GetS3Location(location)
 	case GCS:
-		objectLocation = GetGCSLocation(location, GCSLocationOptionsT{TLDFormat: "gcs"})
-	case AZURE_BLOB:
+		objectLocation = GetGCSLocation(location, GCSLocationOptions{TLDFormat: "gcs"})
+	case AzureBlob:
 		objectLocation = GetAzureBlobLocation(location)
 	}
 	return
 }
 
+func SanitizeJSON(input json.RawMessage) json.RawMessage {
+	v := bytes.ReplaceAll(input, []byte(`\u0000`), []byte(""))
+	if len(v) == 0 {
+		v = []byte(`{}`)
+	}
+	return v
+}
+
+func SanitizeString(input string) string {
+	return strings.ReplaceAll(input, "\u0000", "")
+}
+
 // GetObjectName extracts object/key objectName from different buckets locations
 // ex: https://bucket-endpoint/bucket-name/object -> object
 func GetObjectName(location string, providerConfig interface{}, objectProvider string) (objectName string, err error) {
-	var config map[string]interface{}
+	var destConfig map[string]interface{}
 	var ok bool
-	if config, ok = providerConfig.(map[string]interface{}); !ok {
+	if destConfig, ok = providerConfig.(map[string]interface{}); !ok {
 		return "", errors.New("failed to cast destination config interface{} to map[string]interface{}")
 	}
-	fm, err := filemanager.DefaultFileManagerFactory.New(&filemanager.SettingsT{
+	fm, err := filemanager.New(&filemanager.Settings{
 		Provider: objectProvider,
-		Config:   config,
+		Config:   destConfig,
 	})
 	if err != nil {
 		return "", err
@@ -511,14 +428,14 @@ func GetS3LocationFolder(location string) string {
 	return s3Location[:lastPos]
 }
 
-type GCSLocationOptionsT struct {
+type GCSLocationOptions struct {
 	TLDFormat string
 }
 
 // GetGCSLocation parses path-style location http url to return in gcs:// format
 // https://storage.googleapis.com/test-bucket/test-object.csv --> gcs://test-bucket/test-object.csv
 // tldFormat is used to set return format "<tldFormat>://..."
-func GetGCSLocation(location string, options GCSLocationOptionsT) string {
+func GetGCSLocation(location string, options GCSLocationOptions) string {
 	tld := "gs"
 	if options.TLDFormat != "" {
 		tld = options.TLDFormat
@@ -530,13 +447,13 @@ func GetGCSLocation(location string, options GCSLocationOptionsT) string {
 
 // GetGCSLocationFolder returns the folder path for a gcs object
 // https://storage.googleapis.com/test-bucket/myfolder/test-object.csv --> gcs://test-bucket/myfolder
-func GetGCSLocationFolder(location string, options GCSLocationOptionsT) string {
+func GetGCSLocationFolder(location string, options GCSLocationOptions) string {
 	s3Location := GetGCSLocation(location, options)
 	lastPos := strings.LastIndex(s3Location, "/")
 	return s3Location[:lastPos]
 }
 
-func GetGCSLocations(loadFiles []LoadFileT, options GCSLocationOptionsT) (gcsLocations []string) {
+func GetGCSLocations(loadFiles []LoadFile, options GCSLocationOptions) (gcsLocations []string) {
 	for _, loadFile := range loadFiles {
 		gcsLocations = append(gcsLocations, GetGCSLocation(loadFile.Location, options))
 	}
@@ -558,15 +475,15 @@ func GetAzureBlobLocationFolder(location string) string {
 	return s3Location[:lastPos]
 }
 
-func GetS3Locations(loadFiles []LoadFileT) []LoadFileT {
+func GetS3Locations(loadFiles []LoadFile) []LoadFile {
 	for idx, loadFile := range loadFiles {
 		loadFiles[idx].Location, _ = GetS3Location(loadFile.Location)
 	}
 	return loadFiles
 }
 
-func JSONSchemaToMap(rawMsg json.RawMessage) map[string]map[string]string {
-	schema := make(map[string]map[string]string)
+func JSONSchemaToMap(rawMsg json.RawMessage) model.Schema {
+	schema := make(model.Schema)
 	err := json.Unmarshal(rawMsg, &schema)
 	if err != nil {
 		panic(fmt.Errorf("unmarshalling: %s failed with Error : %w", string(rawMsg), err))
@@ -614,7 +531,10 @@ func ToSafeNamespace(provider, name string) string {
 		extractedValues = append(extractedValues, extractedValue)
 	}
 	namespace := strings.Join(extractedValues, "_")
-	namespace = strcase.ToSnake(namespace)
+	skipNamespaceSnakeCasing := config.GetBool(fmt.Sprintf("Warehouse.%s.skipNamespaceSnakeCasing", WHDestNameMap[provider]), false)
+	if !skipNamespaceSnakeCasing {
+		namespace = strcase.ToSnake(namespace)
+	}
 	if namespace != "" && int(namespace[0]) >= 48 && int(namespace[0]) <= 57 {
 		namespace = "_" + namespace
 	}
@@ -666,18 +586,22 @@ func ObjectStorageType(destType string, config interface{}, useRudderStorage boo
 	return provider
 }
 
-func GetConfigValue(key string, warehouse Warehouse) (val string) {
-	config := warehouse.Destination.Config
-	if config[key] != nil {
-		val, _ = config[key].(string)
+func GetConfigValue(key string, warehouse model.Warehouse) (val string) {
+	configKey := fmt.Sprintf("Warehouse.pipeline.%s.%s.%s", warehouse.Source.ID, warehouse.Destination.ID, key)
+	if config.IsSet(configKey) {
+		return config.GetString(configKey, "")
+	}
+	destConfig := warehouse.Destination.Config
+	if destConfig[key] != nil {
+		val, _ = destConfig[key].(string)
 	}
 	return val
 }
 
-func GetConfigValueBoolString(key string, warehouse Warehouse) string {
-	config := warehouse.Destination.Config
-	if config[key] != nil {
-		if val, ok := config[key].(bool); ok {
+func GetConfigValueBoolString(key string, warehouse model.Warehouse) string {
+	destConfig := warehouse.Destination.Config
+	if destConfig[key] != nil {
+		if val, ok := destConfig[key].(bool); ok {
 			if val {
 				return "true"
 			}
@@ -696,7 +620,7 @@ func GetConfigValueAsMap(key string, config map[string]interface{}) map[string]i
 	return value
 }
 
-func SortColumnKeysFromColumnMap(columnMap map[string]string) []string {
+func SortColumnKeysFromColumnMap(columnMap model.TableSchema) []string {
 	columnKeys := make([]string, 0, len(columnMap))
 	for k := range columnMap {
 		columnKeys = append(columnKeys, k)
@@ -705,7 +629,7 @@ func SortColumnKeysFromColumnMap(columnMap map[string]string) []string {
 	return columnKeys
 }
 
-func IdentityMergeRulesTableName(warehouse Warehouse) string {
+func IdentityMergeRulesTableName(warehouse model.Warehouse) string {
 	return fmt.Sprintf(`%s_%s_%s`, IdentityMergeRulesTable, warehouse.Namespace, warehouse.Destination.ID)
 }
 
@@ -717,11 +641,11 @@ func IdentityMappingsWarehouseTableName(provider string) string {
 	return ToProviderCase(provider, IdentityMappingsTable)
 }
 
-func IdentityMappingsTableName(warehouse Warehouse) string {
+func IdentityMappingsTableName(warehouse model.Warehouse) string {
 	return fmt.Sprintf(`%s_%s_%s`, IdentityMappingsTable, warehouse.Namespace, warehouse.Destination.ID)
 }
 
-func IdentityMappingsUniqueMappingConstraintName(warehouse Warehouse) string {
+func IdentityMappingsUniqueMappingConstraintName(warehouse model.Warehouse) string {
 	return fmt.Sprintf(`unique_merge_property_%s_%s`, warehouse.Namespace, warehouse.Destination.ID)
 }
 
@@ -766,13 +690,13 @@ func JoinWithFormatting(keys []string, format func(idx int, str string) string, 
 	return strings.Join(output, separator)
 }
 
-func CreateAWSSessionConfig(destination *backendconfig.DestinationT, serviceName string) (*awsutils.SessionConfig, error) {
+func CreateAWSSessionConfig(destination *backendconfig.DestinationT, serviceName string) (*awsutil.SessionConfig, error) {
 	if !misc.IsConfiguredToUseRudderObjectStorage(destination.Config) &&
 		(misc.HasAWSRoleARNInConfig(destination.Config) || misc.HasAWSKeysInConfig(destination.Config)) {
 		return awsutils.NewSimpleSessionConfigForDestination(destination, serviceName)
 	}
 	accessKeyID, accessKey := misc.GetRudderObjectStorageAccessKeys()
-	return &awsutils.SessionConfig{
+	return &awsutil.SessionConfig{
 		AccessKeyID: accessKeyID,
 		AccessKey:   accessKey,
 		Service:     serviceName,
@@ -785,7 +709,7 @@ func GetTemporaryS3Cred(destination *backendconfig.DestinationT) (string, string
 		return "", "", "", err
 	}
 
-	awsSession, err := awsutils.CreateSession(sessionConfig)
+	awsSession, err := awsutil.CreateSession(sessionConfig)
 	if err != nil {
 		return "", "", "", err
 	}
@@ -803,7 +727,8 @@ func GetTemporaryS3Cred(destination *backendconfig.DestinationT) (string, string
 	// Create an STS client from just a session.
 	svc := sts.New(awsSession)
 
-	sessionTokenOutput, err := svc.GetSessionToken(&sts.GetSessionTokenInput{DurationSeconds: &AWSCredsExpiryInS})
+	expiryInSec := awsCredsExpiryInS.Load()
+	sessionTokenOutput, err := svc.GetSessionToken(&sts.GetSessionTokenInput{DurationSeconds: &expiryInSec})
 	if err != nil {
 		return "", "", "", err
 	}
@@ -815,27 +740,7 @@ type Tag struct {
 	Value string
 }
 
-func NewTimerStat(name string, extraTags ...Tag) stats.Measurement {
-	tags := stats.Tags{
-		"module": WAREHOUSE,
-	}
-	for _, extraTag := range extraTags {
-		tags[extraTag.Name] = extraTag.Value
-	}
-	return stats.Default.NewTaggedStat(name, stats.TimerType, tags)
-}
-
-func NewCounterStat(name string, extraTags ...Tag) stats.Measurement {
-	tags := stats.Tags{
-		"module": WAREHOUSE,
-	}
-	for _, extraTag := range extraTags {
-		tags[extraTag.Name] = extraTag.Value
-	}
-	return stats.Default.NewTaggedStat(name, stats.CountType, tags)
-}
-
-func WHCounterStat(name string, warehouse *Warehouse, extraTags ...Tag) stats.Measurement {
+func WHCounterStat(name string, warehouse *model.Warehouse, extraTags ...Tag) stats.Measurement {
 	tags := stats.Tags{
 		"module":      WAREHOUSE,
 		"destType":    warehouse.Type,
@@ -944,108 +849,35 @@ func GetSSLKeyDirPath(destinationID string) (whSSLRootDir string) {
 	return sslDirPath
 }
 
-func GetLoadFileType(wh string) string {
-	switch wh {
+func GetLoadFileType(destType string) string {
+	switch destType {
 	case BQ:
-		return LOAD_FILE_TYPE_JSON
+		return LoadFileTypeJson
 	case RS:
-		if useParquetLoadFilesRS {
-			return LOAD_FILE_TYPE_PARQUET
-		}
-		return LOAD_FILE_TYPE_CSV
-	case S3_DATALAKE, GCS_DATALAKE, AZURE_DATALAKE:
-		return LOAD_FILE_TYPE_PARQUET
+		return LoadFileTypeCsv
+	case S3Datalake, GCSDatalake, AzureDatalake:
+		return LoadFileTypeParquet
 	case DELTALAKE:
-		return LOAD_FILE_TYPE_CSV
+		if config.GetBool("Warehouse.deltalake.useParquetLoadFiles", false) {
+			return LoadFileTypeParquet
+		}
+		return LoadFileTypeCsv
 	default:
-		return LOAD_FILE_TYPE_CSV
+		return LoadFileTypeCsv
 	}
 }
 
-func GetLoadFileFormat(whType string) string {
-	switch whType {
-	case BQ:
+func GetLoadFileFormat(loadFileType string) string {
+	switch loadFileType {
+	case LoadFileTypeJson:
 		return "json.gz"
-	case S3_DATALAKE, GCS_DATALAKE, AZURE_DATALAKE:
+	case LoadFileTypeParquet:
 		return "parquet"
-	case RS:
-		if useParquetLoadFilesRS {
-			return "parquet"
-		}
-		return "csv.gz"
-	case DELTALAKE:
+	case LoadFileTypeCsv:
 		return "csv.gz"
 	default:
 		return "csv.gz"
 	}
-}
-
-func GetLoadFilePrefix(timeWindow time.Time, warehouse Warehouse) (timeWindowFormat string) {
-	whType := warehouse.Type
-	switch whType {
-	case GCS_DATALAKE:
-		timeWindowLayout := GetConfigValue("timeWindowLayout", warehouse)
-		if timeWindowLayout == "" {
-			timeWindowLayout = DatalakeTimeWindowFormat
-		}
-
-		timeWindowFormat = timeWindow.Format(timeWindowLayout)
-		tableSuffixPath := GetConfigValue("tableSuffix", warehouse)
-		if tableSuffixPath != "" {
-			timeWindowFormat = fmt.Sprintf("%v/%v", tableSuffixPath, timeWindowFormat)
-		}
-	default:
-		timeWindowFormat = timeWindow.Format(DatalakeTimeWindowFormat)
-	}
-	return timeWindowFormat
-}
-
-func GetRequestWithTimeout(ctx context.Context, url string, timeout time.Duration) ([]byte, error) {
-	req, err := http.NewRequestWithContext(ctx, "GET", url, http.NoBody)
-	if err != nil {
-		return []byte{}, err
-	}
-
-	req.Header.Set("Content-Type", "application/json")
-	req.SetBasicAuth(config.GetWorkspaceToken(), "")
-
-	client := &http.Client{Timeout: timeout}
-	resp, err := client.Do(req)
-	if err != nil {
-		return []byte{}, err
-	}
-
-	var respBody []byte
-	if resp != nil && resp.Body != nil {
-		respBody, _ = io.ReadAll(resp.Body)
-		func() { httputil.CloseResponse(resp) }()
-	}
-
-	return respBody, nil
-}
-
-func PostRequestWithTimeout(ctx context.Context, url string, payload []byte, timeout time.Duration) ([]byte, error) {
-	req, err := http.NewRequestWithContext(ctx, "POST", url, bytes.NewReader(payload))
-	if err != nil {
-		return []byte{}, err
-	}
-
-	req.Header.Set("Content-Type", "application/json")
-	req.SetBasicAuth(config.GetWorkspaceToken(), "")
-
-	client := &http.Client{Timeout: timeout}
-	resp, err := client.Do(req)
-	if err != nil {
-		return []byte{}, err
-	}
-
-	var respBody []byte
-	if resp != nil && resp.Body != nil {
-		respBody, _ = io.ReadAll(resp.Body)
-		func() { httputil.CloseResponse(resp) }()
-	}
-
-	return respBody, nil
 }
 
 func GetDateRangeList(start, end time.Time, dateFormat string) (dateRange []string) {
@@ -1082,16 +914,6 @@ func RandHex() string {
 	return string(buf[:])
 }
 
-func ExtractTunnelInfoFromDestinationConfig(config map[string]interface{}) *tunnelling.TunnelInfo {
-	if tunnelEnabled := ReadAsBool("useSSH", config); !tunnelEnabled {
-		return nil
-	}
-
-	return &tunnelling.TunnelInfo{
-		Config: config,
-	}
-}
-
 func ReadAsBool(key string, config map[string]interface{}) bool {
 	if _, ok := config[key]; ok {
 		if val, ok := config[key].(bool); ok {
@@ -1099,4 +921,21 @@ func ReadAsBool(key string, config map[string]interface{}) bool {
 		}
 	}
 	return false
+}
+
+func GetConnectionTimeout(destType, destID string) time.Duration {
+	destIDLevelConfig := fmt.Sprintf("Warehouse.%s.%s.connectionTimeout", destType, destID)
+	destTypeLevelConfig := fmt.Sprintf("Warehouse.%s.connectionTimeout", destType)
+	warehouseLevelConfig := "Warehouse.connectionTimeout"
+
+	defaultTimeout := int64(3)
+	defaultTimeoutUnits := time.Hour
+
+	if config.IsSet(destIDLevelConfig) {
+		return config.GetDuration(destIDLevelConfig, defaultTimeout, defaultTimeoutUnits)
+	}
+	if config.IsSet(destTypeLevelConfig) {
+		return config.GetDuration(destTypeLevelConfig, defaultTimeout, defaultTimeoutUnits)
+	}
+	return config.GetDuration(warehouseLevelConfig, defaultTimeout, defaultTimeoutUnits)
 }

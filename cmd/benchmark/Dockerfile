@@ -1,5 +1,5 @@
 # syntax=docker/dockerfile:1
-FROM golang:1.19.2-alpine3.16 AS builder
+FROM golang:1.21.0-alpine3.18 AS builder
 
 RUN mkdir workdir
 WORKDIR /workdir

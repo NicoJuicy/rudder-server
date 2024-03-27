@@ -8,8 +8,9 @@ import (
 	"net/http/httptest"
 	"testing"
 
-	cp "github.com/rudderlabs/rudder-server/warehouse/client/controlplane"
 	"github.com/stretchr/testify/require"
+
+	cp "github.com/rudderlabs/rudder-server/warehouse/client/controlplane"
 )
 
 func TestFetchSSHKeys(t *testing.T) {
@@ -53,9 +54,11 @@ func TestFetchSSHKeys(t *testing.T) {
 	}
 
 	for _, tc := range testcases {
-
 		tc := tc
+
 		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.Background()
+
 			svc := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				_, _, ok := r.BasicAuth()
 				require.True(t, ok)
@@ -63,7 +66,7 @@ func TestFetchSSHKeys(t *testing.T) {
 				require.Equal(t, "application/json", r.Header.Get("Content-Type"))
 
 				w.WriteHeader(tc.responseCode)
-				w.Write([]byte(tc.responseBody))
+				_, _ = w.Write([]byte(tc.responseBody))
 			}))
 
 			defer svc.Close()
@@ -73,7 +76,7 @@ func TestFetchSSHKeys(t *testing.T) {
 				Password: "password",
 			})
 
-			keys, err := client.GetDestinationSSHKeys(context.TODO(), tc.destinationID)
+			keys, err := client.GetDestinationSSHKeys(ctx, tc.destinationID)
 			require.Equal(t, tc.expectedError, err)
 			require.Equal(t, tc.expectedKeyPair, keys)
 		})

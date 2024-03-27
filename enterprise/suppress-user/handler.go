@@ -3,8 +3,8 @@ package suppression
 import (
 	"errors"
 
+	"github.com/rudderlabs/rudder-go-kit/logger"
 	"github.com/rudderlabs/rudder-server/enterprise/suppress-user/model"
-	"github.com/rudderlabs/rudder-server/utils/logger"
 )
 
 // newHandler creates a new handler for the suppression feature
@@ -22,11 +22,11 @@ type handler struct {
 	r   Repository
 }
 
-func (h *handler) IsSuppressedUser(workspaceID, userID, sourceID string) bool {
-	h.log.Debugf("IsSuppressedUser called for workspace: %s, user %s, source %s", workspaceID, userID, sourceID)
-	suppressed, err := h.r.Suppressed(workspaceID, userID, sourceID)
-	if err != nil && !errors.Is(err, model.ErrRestoring) {
+func (h *handler) GetSuppressedUser(workspaceID, userID, sourceID string) *model.Metadata {
+	h.log.Debugf("GetSuppressedUser called for workspace: %s, user %s, source %s", workspaceID, userID, sourceID)
+	metadata, err := h.r.Suppressed(workspaceID, userID, sourceID)
+	if err != nil && !errors.Is(err, model.ErrRestoring) && !errors.Is(err, model.ErrKeyNotFound) {
 		h.log.Errorf("Suppression check failed for workspace: %s, user: %s, source: %s: %w", workspaceID, userID, sourceID, err)
 	}
-	return suppressed
+	return metadata
 }

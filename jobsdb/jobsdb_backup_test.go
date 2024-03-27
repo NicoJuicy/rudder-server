@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"compress/gzip"
 	"context"
+	"database/sql"
 	"fmt"
 	"os"
 	"strconv"
@@ -12,25 +13,30 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/lib/pq"
 	"github.com/ory/dockertest/v3"
+	"github.com/samber/lo"
 	"github.com/stretchr/testify/require"
 	"github.com/tidwall/gjson"
 
-	"github.com/rudderlabs/rudder-server/config"
-	backendconfig "github.com/rudderlabs/rudder-server/config/backend-config"
+	"github.com/rudderlabs/rudder-go-kit/config"
+	"github.com/rudderlabs/rudder-go-kit/filemanager"
+	"github.com/rudderlabs/rudder-go-kit/logger"
+	"github.com/rudderlabs/rudder-go-kit/testhelper/docker/resource/minio"
+	"github.com/rudderlabs/rudder-go-kit/testhelper/docker/resource/postgres"
+	backendconfig "github.com/rudderlabs/rudder-server/backend-config"
 	"github.com/rudderlabs/rudder-server/jobsdb/internal/lock"
 	"github.com/rudderlabs/rudder-server/jobsdb/prebackup"
-	"github.com/rudderlabs/rudder-server/services/filemanager"
 	"github.com/rudderlabs/rudder-server/services/fileuploader"
 	"github.com/rudderlabs/rudder-server/testhelper"
-	"github.com/rudderlabs/rudder-server/testhelper/destination"
+	. "github.com/rudderlabs/rudder-server/utils/tx" //nolint:staticcheck
 )
 
 func TestBackupTable(t *testing.T) {
 	var (
 		tc                       backupTestCase
 		prefix                   = "some-prefix"
-		minioResource            *destination.MINIOResource
+		minioResource            *minio.Resource
 		goldenFileJobsFileName   = "testdata/backupJobs.json.gz"
 		goldenFileStatusFileName = "testdata/backupStatus.json.gz"
 	)
@@ -41,10 +47,10 @@ func TestBackupTable(t *testing.T) {
 	cleanup := &testhelper.Cleanup{}
 	defer cleanup.Run()
 
-	postgresResource, err := destination.SetupPostgres(pool, cleanup)
+	postgresResource, err := postgres.Setup(pool, t)
 	require.NoError(t, err)
 
-	minioResource, err = destination.SetupMINIO(pool, cleanup)
+	minioResource, err = minio.Setup(pool, t)
 	require.NoError(t, err)
 
 	// create a unique temporary directory to allow for parallel test execution
@@ -58,14 +64,14 @@ func TestBackupTable(t *testing.T) {
 		t.Setenv("RSERVER_JOBS_DB_BACKUP_RT_ENABLED", "true")
 		t.Setenv("JOBS_BACKUP_BUCKET", "backup-test")
 		t.Setenv("RUDDER_TMPDIR", tmpDir)
-		t.Setenv(config.ConfigKeyToEnv("JobsDB.maxDSSize"), "10")
-		t.Setenv(config.ConfigKeyToEnv("JobsDB.migrateDSLoopSleepDuration"), "3")
+		t.Setenv(config.ConfigKeyToEnv(config.DefaultEnvPrefix, "JobsDB.maxDSSize"), "10")
+		t.Setenv(config.ConfigKeyToEnv(config.DefaultEnvPrefix, "JobsDB.migrateDSLoopSleepDuration"), "3")
 		t.Setenv("JOBS_BACKUP_BUCKET", minioResource.BucketName)
 		t.Setenv("JOBS_BACKUP_PREFIX", prefix)
 
 		t.Setenv("MINIO_ENDPOINT", minioResource.Endpoint)
-		t.Setenv("MINIO_ACCESS_KEY_ID", minioResource.AccessKey)
-		t.Setenv("MINIO_SECRET_ACCESS_KEY", minioResource.SecretKey)
+		t.Setenv("MINIO_ACCESS_KEY_ID", minioResource.AccessKeyID)
+		t.Setenv("MINIO_SECRET_ACCESS_KEY", minioResource.AccessKeySecret)
 		t.Setenv("MINIO_SSL", "false")
 
 		t.Setenv("JOBS_DB_DB_NAME", postgresResource.Database)
@@ -91,42 +97,44 @@ func TestBackupTable(t *testing.T) {
 	fileUploaderProvider := fileuploader.NewDefaultProvider()
 
 	// batch_rt jobsdb is taking a full backup
-	tc.insertBatchRTData(t, jobs, duplicateStatusList, cleanup, fileUploaderProvider)
+	tc.insertBatchRTData(t, jobs, duplicateStatusList, fileUploaderProvider)
 
 	// rt jobsdb is taking a backup of failed jobs only
-	tc.insertRTData(t, jobs, statusList, cleanup, fileUploaderProvider)
+	tc.insertRTData(t, jobs, statusList, fileUploaderProvider)
 	require.NoError(t, err, "expected no error while inserting rt data")
 
 	// create a filemanager instance
-	fmFactory := filemanager.FileManagerFactoryT{}
-	fm, err := fmFactory.New(&filemanager.SettingsT{
+	fm, err := filemanager.New(&filemanager.Settings{
 		Provider: "MINIO",
 		Config: map[string]interface{}{
 			"bucketName":      minioResource.BucketName,
 			"prefix":          prefix,
 			"endPoint":        minioResource.Endpoint,
-			"accessKeyID":     minioResource.AccessKey,
-			"secretAccessKey": minioResource.SecretKey,
+			"accessKeyID":     minioResource.AccessKeyID,
+			"secretAccessKey": minioResource.AccessKeySecret,
 			"useSSL":          false,
 		},
 	})
 	require.NoError(t, err, "expected no error while creating file manager")
 
 	// wait for the backup to finish
-	var file []*filemanager.FileObject
+	var file []*filemanager.FileInfo
 	require.Eventually(t, func() bool {
-		file, err = fm.ListFilesWithPrefix(context.Background(), "", prefix, 5)
+		file, err = fm.ListFilesWithPrefix(context.Background(), "", prefix, 5).Next()
 
 		if len(file) != 3 {
-			t.Log("file list: ", file, " err: ", err)
-			fm, _ = fmFactory.New(&filemanager.SettingsT{
+			t.Logf("file list: %+v err: %v", lo.Map(file, func(item *filemanager.FileInfo, _ int) string {
+				return item.Key
+			}), err)
+			fm, _ = filemanager.New(&filemanager.Settings{
+				Logger:   logger.NOP,
 				Provider: "MINIO",
 				Config: map[string]interface{}{
 					"bucketName":      minioResource.BucketName,
 					"prefix":          prefix,
 					"endPoint":        minioResource.Endpoint,
-					"accessKeyID":     minioResource.AccessKey,
-					"secretAccessKey": minioResource.SecretKey,
+					"accessKeyID":     minioResource.AccessKeyID,
+					"secretAccessKey": minioResource.AccessKeySecret,
 					"useSSL":          false,
 				},
 			})
@@ -151,13 +159,13 @@ func TestBackupTable(t *testing.T) {
 	}
 
 	// Verify aborted jobs backup
-	f := tc.downloadFile(t, fm, abortedJobsBackupFilename, cleanup)
+	f := tc.downloadFile(t, fm, abortedJobsBackupFilename)
 	abortedJobs, abortedStatus := tc.getJobsFromAbortedJobs(t, f)
 	require.Equal(t, jobs, abortedJobs, "expected jobs to be same in case of only aborted backup")
 	require.Equal(t, statusList, abortedStatus, "expected status to be same in case of only aborted backup")
 
 	// Verify full backup of job statuses
-	f = tc.downloadFile(t, fm, jobStatusBackupFilename, cleanup)
+	f = tc.downloadFile(t, fm, jobStatusBackupFilename)
 	backedupStatus, err := tc.readGzipStatusFile(f.Name())
 	require.NoError(t, err, "expected no error while reading backedup status file")
 	goldenStatusFile, err := tc.readGzipStatusFile(goldenFileStatusFileName)
@@ -166,7 +174,7 @@ func TestBackupTable(t *testing.T) {
 	require.Equal(t, len(goldenStatusFile), len(backedupStatus), "expected status files to be same")
 
 	// Verify full backup of jobs
-	f = tc.downloadFile(t, fm, jobsBackupFilename, cleanup)
+	f = tc.downloadFile(t, fm, jobsBackupFilename)
 	backedupJobs, err := tc.readGzipJobFile(f.Name())
 	require.NoError(t, err, "expected no error while reading backedup status file")
 	goldenFileJobs, err := tc.readGzipJobFile(goldenFileJobsFileName)
@@ -178,7 +186,7 @@ func TestMultipleWorkspacesBackupTable(t *testing.T) {
 	var (
 		tc                       backupTestCase
 		prefix                   = "some-prefix"
-		minioResource            []*destination.MINIOResource
+		minioResource            []*minio.Resource
 		goldenFileJobsFileName   = "testdata/MultiWorkspaceBackupJobs.json.gz"
 		goldenFileStatusFileName = "testdata/MultiWorkspaceBackupStatus.json.gz"
 		uniqueWorkspaces         = 3
@@ -187,15 +195,13 @@ func TestMultipleWorkspacesBackupTable(t *testing.T) {
 	// running minio container on docker
 	pool, err := dockertest.NewPool("")
 	require.NoError(t, err, "Failed to create docker pool")
-	cleanup := &testhelper.Cleanup{}
-	defer cleanup.Run()
 
-	postgresResource, err := destination.SetupPostgres(pool, cleanup)
+	postgresResource, err := postgres.Setup(pool, t)
 	require.NoError(t, err)
 
-	minioResource = make([]*destination.MINIOResource, uniqueWorkspaces)
+	minioResource = make([]*minio.Resource, uniqueWorkspaces)
 	for i := 0; i < uniqueWorkspaces; i++ {
-		minioResource[i], err = destination.SetupMINIO(pool, cleanup)
+		minioResource[i], err = minio.Setup(pool, t)
 		require.NoError(t, err)
 	}
 
@@ -209,8 +215,8 @@ func TestMultipleWorkspacesBackupTable(t *testing.T) {
 		t.Setenv("RSERVER_JOBS_DB_BACKUP_RT_ENABLED", "true")
 		t.Setenv("JOBS_BACKUP_BUCKET", "backup-test")
 		t.Setenv("RUDDER_TMPDIR", tmpDir)
-		t.Setenv(config.ConfigKeyToEnv("JobsDB.maxDSSize"), "10")
-		t.Setenv(config.ConfigKeyToEnv("JobsDB.migrateDSLoopSleepDuration"), "3")
+		t.Setenv(config.ConfigKeyToEnv(config.DefaultEnvPrefix, "JobsDB.maxDSSize"), "10")
+		t.Setenv(config.ConfigKeyToEnv(config.DefaultEnvPrefix, "JobsDB.migrateDSLoopSleepDuration"), "3")
 		t.Setenv("MINIO_SSL", "false")
 
 		t.Setenv("JOBS_DB_DB_NAME", postgresResource.Database)
@@ -245,8 +251,8 @@ func TestMultipleWorkspacesBackupTable(t *testing.T) {
 					"bucketName":      minioResource[0].BucketName,
 					"prefix":          prefix,
 					"endPoint":        minioResource[0].Endpoint,
-					"accessKeyID":     minioResource[0].AccessKey,
-					"secretAccessKey": minioResource[0].SecretKey,
+					"accessKeyID":     minioResource[0].AccessKeyID,
+					"secretAccessKey": minioResource[0].AccessKeySecret,
 				},
 			},
 			Preferences: backendconfig.StoragePreferences{
@@ -263,8 +269,8 @@ func TestMultipleWorkspacesBackupTable(t *testing.T) {
 					"bucketName":      minioResource[1].BucketName,
 					"prefix":          prefix,
 					"endPoint":        minioResource[1].Endpoint,
-					"accessKeyID":     minioResource[1].AccessKey,
-					"secretAccessKey": minioResource[1].SecretKey,
+					"accessKeyID":     minioResource[1].AccessKeyID,
+					"secretAccessKey": minioResource[1].AccessKeySecret,
 				},
 			},
 			Preferences: backendconfig.StoragePreferences{
@@ -281,8 +287,8 @@ func TestMultipleWorkspacesBackupTable(t *testing.T) {
 					"bucketName":      minioResource[2].BucketName,
 					"prefix":          prefix,
 					"endPoint":        minioResource[2].Endpoint,
-					"accessKeyID":     minioResource[2].AccessKey,
-					"secretAccessKey": minioResource[2].SecretKey,
+					"accessKeyID":     minioResource[2].AccessKeyID,
+					"secretAccessKey": minioResource[2].AccessKeySecret,
 				},
 			},
 			Preferences: backendconfig.StoragePreferences{
@@ -297,10 +303,10 @@ func TestMultipleWorkspacesBackupTable(t *testing.T) {
 	fileuploaderProvider := fileuploader.NewStaticProvider(storageSettings)
 
 	// batch_rt jobsdb is taking a full backup
-	tc.insertBatchRTData(t, jobs, duplicateStatusList, cleanup, fileuploaderProvider)
+	tc.insertBatchRTData(t, jobs, duplicateStatusList, fileuploaderProvider)
 
 	// rt jobsdb is taking a backup of failed jobs only
-	tc.insertRTData(t, jobs, statusList, cleanup, fileuploaderProvider)
+	tc.insertRTData(t, jobs, statusList, fileuploaderProvider)
 	require.NoError(t, err, "expected no error while inserting rt data")
 
 	// wait for the backup to finish
@@ -308,19 +314,23 @@ func TestMultipleWorkspacesBackupTable(t *testing.T) {
 		workspace := "defaultWorkspaceID-" + strconv.Itoa(i+1)
 		fm, err := fileuploaderProvider.GetFileManager(workspace)
 		require.NoError(t, err)
-		var file []*filemanager.FileObject
+		var file []*filemanager.FileInfo
 		require.Eventually(t, func() bool {
-			file, err = fm.ListFilesWithPrefix(context.Background(), "", prefix, 10)
+			file, err = fm.ListFilesWithPrefix(context.Background(), "", prefix, 10).Next()
 
 			if len(file) != 3 {
-				t.Log("file list: ", file, " err: ", err, "len: ", len(file))
+				t.Logf("file list: %+v err: %v", lo.Map(file, func(item *filemanager.FileInfo, _ int) string {
+					return item.Key
+				}), err)
 				fm, err = fileuploaderProvider.GetFileManager(workspace)
 				require.NoError(t, err)
 				return false
 			}
 			return true
 		}, 30*time.Second, 1*time.Second, fmt.Errorf("less than 3 backup files found in backup store for workspace:%s. Error: %w ", workspace, err))
-		t.Log("file list: ", file, " err: ", err)
+		t.Logf("file list: %+v err: %v", lo.Map(file, func(item *filemanager.FileInfo, _ int) string {
+			return item.Key
+		}), err)
 
 		var jobStatusBackupFilename, jobsBackupFilename, abortedJobsBackupFilename string
 		for j := 0; j < len(file); j++ {
@@ -341,7 +351,7 @@ func TestMultipleWorkspacesBackupTable(t *testing.T) {
 		require.NotEmpty(t, abortedJobsBackupFilename)
 
 		// Verify aborted jobs backup
-		f := tc.downloadFile(t, fm, abortedJobsBackupFilename, cleanup)
+		f := tc.downloadFile(t, fm, abortedJobsBackupFilename)
 		abortedJobs, abortedStatus := tc.getJobsFromAbortedJobs(t, f)
 		require.NotZero(t, len(abortedJobs))
 		require.NotZero(t, len(abortedStatus))
@@ -349,7 +359,7 @@ func TestMultipleWorkspacesBackupTable(t *testing.T) {
 		require.Equal(t, jobStatusByWorkspace[workspace], abortedStatus, "expected status to be same in case of only aborted backup")
 
 		// Verify full backup of job statuses
-		f = tc.downloadFile(t, fm, jobStatusBackupFilename, cleanup)
+		f = tc.downloadFile(t, fm, jobStatusBackupFilename)
 		backedupStatus, err := tc.readGzipStatusFile(f.Name())
 		require.NotZero(t, len(backedupStatus))
 		require.NoError(t, err, "expected no error while reading backedup status file")
@@ -357,7 +367,7 @@ func TestMultipleWorkspacesBackupTable(t *testing.T) {
 		require.Equal(t, len(jobStatusByWorkspace[workspace]), len(backedupStatus), "expected status files to be same")
 
 		// Verify full backup of jobs
-		f = tc.downloadFile(t, fm, jobsBackupFilename, cleanup)
+		f = tc.downloadFile(t, fm, jobsBackupFilename)
 		backedupJobs, err := tc.readGzipJobFile(f.Name())
 		require.NotZero(t, len(backedupJobs))
 		require.NoError(t, err, "expected no error while reading backedup status file")
@@ -391,15 +401,15 @@ func duplicateStatuses(statusList []*JobStatusT, duplicateCount int) []*JobStatu
 	return res
 }
 
-func (*backupTestCase) insertRTData(t *testing.T, jobs []*JobT, statusList []*JobStatusT, cleanup *testhelper.Cleanup, fileuploader fileuploader.Provider) {
+func (*backupTestCase) insertRTData(t *testing.T, jobs []*JobT, statusList []*JobStatusT, fileuploader fileuploader.Provider) {
 	triggerAddNewDS := make(chan time.Time)
 
-	jobsDB := &HandleT{
+	jobsDB := &Handle{
 		TriggerAddNewDS: func() <-chan time.Time {
 			return triggerAddNewDS
 		},
 	}
-	err := jobsDB.Setup(ReadWrite, false, "rt", true, []prebackup.Handler{}, fileuploader)
+	err := jobsDB.Setup(ReadWrite, false, "rt", []prebackup.Handler{}, fileuploader)
 	require.NoError(t, err)
 
 	rtDS := newDataSet("rt", "1")
@@ -423,20 +433,20 @@ func (*backupTestCase) insertRTData(t *testing.T, jobs []*JobT, statusList []*Jo
 		return jobsDB.copyJobStatusDS(context.Background(), tx, rtDS2, statusList, []string{})
 	})
 	require.NoError(t, err)
-	cleanup.Cleanup(func() {
+	t.Cleanup(func() {
 		jobsDB.TearDown()
 	})
 }
 
-func (*backupTestCase) insertBatchRTData(t *testing.T, jobs []*JobT, statusList []*JobStatusT, cleanup *testhelper.Cleanup, fileUploaderProvider fileuploader.Provider) {
+func (*backupTestCase) insertBatchRTData(t *testing.T, jobs []*JobT, statusList []*JobStatusT, fileUploaderProvider fileuploader.Provider) {
 	triggerAddNewDS := make(chan time.Time)
-	jobsDB := &HandleT{
+	jobsDB := &Handle{
 		TriggerAddNewDS: func() <-chan time.Time {
 			return triggerAddNewDS
 		},
 	}
 
-	err := jobsDB.Setup(ReadWrite, false, "batch_rt", true, []prebackup.Handler{}, fileUploaderProvider)
+	err := jobsDB.Setup(ReadWrite, false, "batch_rt", []prebackup.Handler{}, fileUploaderProvider)
 	require.NoError(t, err)
 
 	ds := newDataSet("batch_rt", "1")
@@ -462,7 +472,7 @@ func (*backupTestCase) insertBatchRTData(t *testing.T, jobs []*JobT, statusList 
 		return jobsDB.copyJobStatusDS(context.Background(), tx, ds2, statusList, []string{})
 	})
 	require.NoError(t, err)
-	cleanup.Cleanup(func() {
+	t.Cleanup(func() {
 		jobsDB.TearDown()
 	})
 }
@@ -480,8 +490,8 @@ func (*backupTestCase) getJobsFromAbortedJobs(t *testing.T, file *os.File) ([]*J
 	buf := make([]byte, maxCapacity)
 	sc.Buffer(buf, maxCapacity)
 
-	jobs := []*JobT{}
-	statusList := []*JobStatusT{}
+	var jobs []*JobT
+	var statusList []*JobStatusT
 
 	for sc.Scan() {
 		lineByte := sc.Bytes()
@@ -511,7 +521,7 @@ func (*backupTestCase) getJobsFromAbortedJobs(t *testing.T, file *os.File) ([]*J
 	return jobs, statusList
 }
 
-func (*backupTestCase) downloadFile(t *testing.T, fm filemanager.FileManager, fileToDownload string, cleanup *testhelper.Cleanup) *os.File {
+func (*backupTestCase) downloadFile(t *testing.T, fm filemanager.FileManager, fileToDownload string) *os.File {
 	file, err := os.CreateTemp("", "backedupfile")
 	require.NoError(t, err, "expected no error while creating temporary file")
 
@@ -525,7 +535,7 @@ func (*backupTestCase) downloadFile(t *testing.T, fm filemanager.FileManager, fi
 	require.NoError(t, err, "expected no error while reopening downloaded file")
 
 	require.NoError(t, err)
-	cleanup.Cleanup(func() {
+	t.Cleanup(func() {
 		_ = file.Close()
 		_ = os.Remove(file.Name())
 	})
@@ -552,7 +562,7 @@ func (*backupTestCase) readGzipJobFile(filename string) ([]*JobT, error) {
 	buf := make([]byte, maxCapacity)
 	sc.Buffer(buf, maxCapacity)
 
-	jobs := []*JobT{}
+	var jobs []*JobT
 	for sc.Scan() {
 		lineByte := sc.Bytes()
 		uuid := uuid.MustParse("69359037-9599-48e7-b8f2-48393c019135")
@@ -591,7 +601,7 @@ func (*backupTestCase) readGzipStatusFile(fileName string) ([]*JobStatusT, error
 	buf := make([]byte, maxCapacity)
 	sc.Buffer(buf, maxCapacity)
 
-	statusList := []*JobStatusT{}
+	var statusList []*JobStatusT
 	for sc.Scan() {
 		lineByte := sc.Bytes()
 		jobStatus := &JobStatusT{
@@ -629,4 +639,73 @@ func getStatusByWorkspace(jobStatus []*JobStatusT, jobsByWorkspace map[string][]
 		}
 	}
 	return jobStatusByWorkspace
+}
+
+func (jd *Handle) copyJobStatusDS(ctx context.Context, tx *Tx, ds dataSetT, statusList []*JobStatusT, customValFilters []string) (err error) {
+	if len(statusList) == 0 {
+		return nil
+	}
+	tags := statTags{CustomValFilters: customValFilters, ParameterFilters: nil}
+	_, err = jd.updateJobStatusDSInTx(ctx, tx, ds, statusList, tags)
+	if err != nil {
+		return err
+	}
+	// We are manually triggering ANALYZE to help with query planning since a large
+	// amount of rows are being copied in the table in a very short time and
+	// AUTOVACUUM might not have a chance to do its work before we start querying
+	// this table
+	_, err = tx.ExecContext(ctx, fmt.Sprintf(`ANALYZE %q`, ds.JobStatusTable))
+	if err != nil {
+		return err
+	}
+
+	return nil
+}
+
+func (jd *Handle) copyJobsDS(tx *Tx, ds dataSetT, jobList []*JobT) error { // When fixing callers make sure error is handled with assertError
+	defer jd.getTimerStat(
+		"copy_jobs",
+		&statTags{CustomValFilters: []string{jd.tablePrefix}},
+	).RecordDuration()()
+
+	tx.AddSuccessListener(func() {
+		jd.invalidateCacheForJobs(ds, jobList)
+	})
+	return jd.copyJobsDSInTx(tx, ds, jobList)
+}
+
+func (*Handle) copyJobsDSInTx(txHandler transactionHandler, ds dataSetT, jobList []*JobT) error {
+	var stmt *sql.Stmt
+	var err error
+
+	stmt, err = txHandler.Prepare(pq.CopyIn(ds.JobTable, "job_id", "uuid", "user_id", "custom_val", "parameters",
+		"event_payload", "event_count", "created_at", "expire_at", "workspace_id"))
+	if err != nil {
+		return err
+	}
+
+	defer func() { _ = stmt.Close() }()
+
+	for _, job := range jobList {
+		eventCount := 1
+		if job.EventCount > 1 {
+			eventCount = job.EventCount
+		}
+
+		_, err = stmt.Exec(job.JobID, job.UUID, job.UserID, job.CustomVal, string(job.Parameters),
+			string(job.EventPayload), eventCount, job.CreatedAt, job.ExpireAt, job.WorkspaceId)
+		if err != nil {
+			return err
+		}
+	}
+	if _, err = stmt.Exec(); err != nil {
+		return err
+	}
+
+	// We are manually triggering ANALYZE to help with query planning since a large
+	// amount of rows are being copied in the table in a very short time and
+	// AUTOVACUUM might not have a chance to do its work before we start querying
+	// this table
+	_, err = txHandler.Exec(fmt.Sprintf(`ANALYZE %q`, ds.JobTable))
+	return err
 }

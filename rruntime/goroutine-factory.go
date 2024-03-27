@@ -4,6 +4,7 @@ import (
 	"context"
 
 	"github.com/bugsnag/bugsnag-go/v2"
+
 	"github.com/rudderlabs/rudder-server/utils/misc"
 )
 
@@ -34,4 +35,12 @@ func GoForWarehouse(function func()) {
 		defer misc.BugsnagNotify(ctx, "Warehouse")()
 		function()
 	}()
+}
+
+var GoRoutineFactory goRoutineFactory
+
+type goRoutineFactory struct{}
+
+func (goRoutineFactory) Go(function func()) {
+	Go(function)
 }

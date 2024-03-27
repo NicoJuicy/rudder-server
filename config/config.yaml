@@ -61,7 +61,6 @@ TransformationDebugger:
 Archiver:
   backupRowsBatchSize: 100
 JobsDB:
-  fairPickup: true
   jobDoneMigrateThres: 0.8
   jobStatusMigrateThres: 5
   maxDSSize: 100000
@@ -119,7 +118,7 @@ Router:
   MARKETO:
     noOfWorkers: 4
   throttler:
-    algorithm: gorate
+    algorithm: gcra
 #    redis:
 #      addr: localhost:6379
 #      username: ""
@@ -136,7 +135,6 @@ Router:
     httpTimeout: 120s
     httpMaxIdleConnsPerHost: 32
 BatchRouter:
-  mainLoopSleep: 2s
   jobQueryBatchSize: 100000
   uploadFreq: 30s
   warehouseServiceMaxRetryTime: 3h
@@ -162,7 +160,6 @@ Warehouse:
   enableJitterForSyncs: false
   redshift:
     maxParallelLoads: 3
-    setVarCharMax: false
   snowflake:
     maxParallelLoads: 3
   bigquery:
@@ -258,3 +255,5 @@ PgNotifier:
   retriggerCount: 500
   trackBatchInterval: 2s
   maxAttempt: 3
+Reporting:
+  eventNameMaxLength: 0

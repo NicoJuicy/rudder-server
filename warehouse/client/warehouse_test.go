@@ -11,8 +11,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/rudderlabs/rudder-server/warehouse/client"
 	"github.com/stretchr/testify/require"
+
+	"github.com/rudderlabs/rudder-server/warehouse/client"
 )
 
 func loadFile(t *testing.T, path string) string {
@@ -57,8 +58,6 @@ func TestWarehouse(t *testing.T) {
 			LastEventAt:           "2022-11-08T13:23:07Z",
 			UseRudderStorage:      false,
 			DestinationRevisionID: "2H1cLBvL3v0prRBNzpe8D34XTzU",
-			SourceBatchID:         "<source-batch-id>",
-			SourceTaskID:          "<source-task-id>",
 			SourceTaskRunID:       "<source-task-run-id>",
 			SourceJobID:           "<source-job-id>",
 			SourceJobRunID:        "<source-job-run-id>",
@@ -117,7 +116,7 @@ func TestWarehouse(t *testing.T) {
 
 		ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			w.WriteHeader(http.StatusBadRequest)
-			fmt.Fprintf(w, "bad request")
+			_, _ = fmt.Fprintf(w, "bad request")
 		}))
 		t.Cleanup(ts.Close)
 

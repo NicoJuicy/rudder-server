@@ -1,11 +1,11 @@
 <p align="center">
-  🔥 <b>New: Just launched <a href="https://github.com/rudderlabs/rudder-server/discussions/2401">RudderStack v1.0</a></b>
+📖 Just launched <b><a href="https://www.rudderstack.com/learn/">Data Learning Center</a></b> - Resources on data engineering and data infrastructure
   <br/>
  </p>
 
 <p align="center">
   <a href="https://www.rudderstack.com/">
-    <img src="resources/logo.png">
+    <img src="resources/rs-logo-full-duotone-dark.jpg" height="64px">
   </a>
 </p>
 
@@ -28,7 +28,7 @@
     <img src="https://img.shields.io/docker/pulls/rudderlabs/rudder-server">
   </a>
   <a href="https://github.com/rudderlabs/rudder-server/blob/master/LICENSE">
-    <img src="https://img.shields.io/github/license/rudderlabs/rudder-server">
+    <img src="https://img.shields.io/static/v1?label=license&message=ELv2&color=7447fc">
   </a>
 </p>
 
@@ -117,6 +117,5 @@ We would love to see you contribute to RudderStack. Get more information on how 
 
 ## License
 
-RudderStack server is released under the [**AGPLv3 License**](https://github.com/rudderlabs/rudder-server/blob/master/LICENSE).
+RudderStack server is released under the [**Elastic License 2.0**](LICENSE).
 
-Read [**our blog**](https://www.rudderstack.com/blog/rudderstacks-licensing-explained/) to know more about how our software is licensed.

@@ -12,20 +12,87 @@ import (
 	"testing"
 	"time"
 
-	"github.com/rudderlabs/rudder-server/utils/logger"
+	"github.com/rudderlabs/rudder-server/warehouse/internal/model"
+
+	"github.com/rudderlabs/rudder-go-kit/awsutil"
+	"github.com/rudderlabs/rudder-go-kit/logger"
 
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 
 	"github.com/stretchr/testify/require"
 
-	"github.com/rudderlabs/rudder-server/config"
-	"github.com/rudderlabs/rudder-server/utils/awsutils"
+	"github.com/rudderlabs/rudder-go-kit/config"
 	"github.com/rudderlabs/rudder-server/utils/misc"
 
-	backendconfig "github.com/rudderlabs/rudder-server/config/backend-config"
+	backendconfig "github.com/rudderlabs/rudder-server/backend-config"
 	. "github.com/rudderlabs/rudder-server/warehouse/utils"
 )
+
+func TestSanitizeJSON(t *testing.T) {
+	testCases := []struct {
+		name     string
+		input    json.RawMessage
+		expected json.RawMessage
+	}{
+		{
+			name:     "empty json",
+			input:    json.RawMessage(`{}`),
+			expected: json.RawMessage(`{}`),
+		},
+		{
+			name:     "with unicode characters",
+			input:    json.RawMessage(`{"exporting_data_failed":{"attempt":1,"errors":["Start: \u0000\u0000\u0000\u0000\u0000\u0000\u0000 : End"]}}`),
+			expected: json.RawMessage(`{"exporting_data_failed":{"attempt":1,"errors":["Start:  : End"]}}`),
+		},
+		{
+			name:     "without unicode characters",
+			input:    json.RawMessage(`{"exporting_data_failed":{"attempt":1,"errors":["Start:  : End"]}}`),
+			expected: json.RawMessage(`{"exporting_data_failed":{"attempt":1,"errors":["Start:  : End"]}}`),
+		},
+	}
+
+	for _, tc := range testCases {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			require.Equal(t, tc.expected, SanitizeJSON(tc.input))
+		})
+	}
+}
+
+func TestSanitizeString(t *testing.T) {
+	testCases := []struct {
+		name     string
+		input    string
+		expected string
+	}{
+		{
+			name:  "empty string",
+			input: "",
+		},
+		{
+			name:     "with unicode characters",
+			input:    "Start: \u0000\u0000\u0000\u0000\u0000\u0000\u0000 : End",
+			expected: "Start:  : End",
+		},
+		{
+			name:     "without unicode characters",
+			input:    "Start:  : End",
+			expected: "Start:  : End",
+		},
+	}
+
+	for _, tc := range testCases {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			require.Equal(t, tc.expected, SanitizeString(tc.input))
+		})
+	}
+}
 
 func TestDestinationConfigKeys(t *testing.T) {
 	for _, whType := range WarehouseDestinations {
@@ -34,7 +101,7 @@ func TestDestinationConfigKeys(t *testing.T) {
 
 			whName := WHDestNameMap[whType]
 			configKey := fmt.Sprintf("Warehouse.%s.feature", whName)
-			got := config.ConfigKeyToEnv(configKey)
+			got := config.ConfigKeyToEnv(config.DefaultEnvPrefix, configKey)
 			expected := fmt.Sprintf("RSERVER_WAREHOUSE_%s_FEATURE", strings.ToUpper(whName))
 			require.Equal(t, got, expected)
 		})
@@ -212,13 +279,13 @@ func TestGetS3LocationFolder(t *testing.T) {
 }
 
 func TestGetS3Locations(t *testing.T) {
-	inputs := []LoadFileT{
+	inputs := []LoadFile{
 		{Location: "https://test-bucket.s3.amazonaws.com/test-object.csv"},
 		{Location: "https://test-bucket.s3.eu-west-1.amazonaws.com/test-object.csv"},
 		{Location: "https://my.test-bucket.s3.amazonaws.com/test-object.csv"},
 		{Location: "https://my.test-bucket.s3.us-west-1.amazonaws.com/test-object.csv"},
 	}
-	outputs := []LoadFileT{
+	outputs := []LoadFile{
 		{Location: "s3://test-bucket/test-object.csv"},
 		{Location: "s3://test-bucket/test-object.csv"},
 		{Location: "s3://my.test-bucket/test-object.csv"},
@@ -255,7 +322,7 @@ func TestGetGCSLocation(t *testing.T) {
 		},
 	}
 	for _, input := range inputs {
-		gcsLocation := GetGCSLocation(input.location, GCSLocationOptionsT{
+		gcsLocation := GetGCSLocation(input.location, GCSLocationOptions{
 			TLDFormat: input.format,
 		})
 		require.Equal(t, gcsLocation, input.gcsLocation)
@@ -277,13 +344,13 @@ func TestGetGCSLocationFolder(t *testing.T) {
 		},
 	}
 	for _, input := range inputs {
-		gcsLocationFolder := GetGCSLocationFolder(input.location, GCSLocationOptionsT{})
+		gcsLocationFolder := GetGCSLocationFolder(input.location, GCSLocationOptions{})
 		require.Equal(t, gcsLocationFolder, input.gcsLocationFolder)
 	}
 }
 
 func TestGetGCSLocations(t *testing.T) {
-	inputs := []LoadFileT{
+	inputs := []LoadFile{
 		{Location: "https://storage.googleapis.com/test-bucket/test-object.csv"},
 		{Location: "https://storage.googleapis.com/my.test-bucket/test-object.csv"},
 		{Location: "https://storage.googleapis.com/my.test-bucket2/test-object.csv"},
@@ -296,7 +363,7 @@ func TestGetGCSLocations(t *testing.T) {
 		"gs://my.test-bucket/test-object2.csv",
 	}
 
-	gcsLocations := GetGCSLocations(inputs, GCSLocationOptionsT{})
+	gcsLocations := GetGCSLocations(inputs, GCSLocationOptions{})
 	require.Equal(t, gcsLocations, outputs)
 }
 
@@ -333,6 +400,9 @@ func TestGetAzureBlobLocationFolder(t *testing.T) {
 }
 
 func TestToSafeNamespace(t *testing.T) {
+	config.Set("Warehouse.bigquery.skipNamespaceSnakeCasing", true)
+	defer config.Reset()
+
 	inputs := []struct {
 		provider      string
 		namespace     string
@@ -386,6 +456,16 @@ func TestToSafeNamespace(t *testing.T) {
 			provider:      "RS",
 			namespace:     "group",
 			safeNamespace: "_group",
+		},
+		{
+			provider:      "RS",
+			namespace:     "k3_namespace",
+			safeNamespace: "k_3_namespace",
+		},
+		{
+			provider:      "BQ",
+			namespace:     "k3_namespace",
+			safeNamespace: "k3_namespace",
 		},
 	}
 	for _, input := range inputs {
@@ -495,75 +575,12 @@ func TestDoubleQuoteAndJoinByComma(t *testing.T) {
 }
 
 func TestSortColumnKeysFromColumnMap(t *testing.T) {
-	columnMap := map[string]string{"k5": "V5", "k4": "V4", "k3": "V3", "k2": "V2", "k1": "V1"}
+	columnMap := model.TableSchema{"k5": "V5", "k4": "V4", "k3": "V3", "k2": "V2", "k1": "V1"}
 	want := []string{"k1", "k2", "k3", "k4", "k5"}
 	got := SortColumnKeysFromColumnMap(columnMap)
 	require.Equal(t, got, want)
 	if !reflect.DeepEqual(got, want) {
 		t.Errorf("got %#v want %#v input %#v", got, want, columnMap)
-	}
-}
-
-func TestGetLoadFileGenTime(t *testing.T) {
-	inputs := []struct {
-		timingsMap        sql.NullString
-		loadFilesEpochStr string
-	}{
-		{
-			timingsMap: sql.NullString{
-				String: "[{\"generating_upload_schema\":\"2022-07-04T16:09:03.001Z\"},{\"generated_upload_schema\":\"2022-07-04T16:09:04.141Z\"},{\"creating_table_uploads\":\"2022-07-04T16:09:04.144Z\"},{\"created_table_uploads\":\"2022-07-04T16:09:04.164Z\"},{\"generating_load_files\":\"2022-07-04T16:09:04.169Z\"},{\"generated_load_files\":\"2022-07-04T16:09:40.957Z\"},{\"updating_table_uploads_counts\":\"2022-07-04T16:09:40.959Z\"},{\"updated_table_uploads_counts\":\"2022-07-04T16:09:41.916Z\"},{\"creating_remote_schema\":\"2022-07-04T16:09:41.918Z\"},{\"created_remote_schema\":\"2022-07-04T16:09:41.920Z\"},{\"exporting_data\":\"2022-07-04T16:09:41.922Z\"},{\"exporting_data_failed\":\"2022-07-04T17:14:24.424Z\"}]",
-			},
-			loadFilesEpochStr: "2022-07-04T16:09:04.169Z",
-		},
-		{
-			timingsMap: sql.NullString{
-				String: "[]",
-			},
-			loadFilesEpochStr: "0001-01-01T00:00:00.000Z",
-		},
-		{
-			timingsMap: sql.NullString{
-				String: "[{\"generating_upload_schema\":\"2022-07-04T16:09:03.001Z\"},{\"generated_upload_schema\":\"2022-07-04T16:09:04.141Z\"},{\"creating_table_uploads\":\"2022-07-04T16:09:04.144Z\"},{\"created_table_uploads\":\"2022-07-04T16:09:04.164Z\"}]",
-			},
-			loadFilesEpochStr: "0001-01-01T00:00:00.000Z",
-		},
-	}
-	for _, input := range inputs {
-		loadFilesEpochTime, err := time.Parse(misc.RFC3339Milli, input.loadFilesEpochStr)
-		require.NoError(t, err)
-
-		loadFileGenTime := GetLoadFileGenTime(input.timingsMap)
-		require.Equal(t, loadFilesEpochTime, loadFileGenTime)
-	}
-}
-
-func TestGetLastFailedStatus(t *testing.T) {
-	inputs := []struct {
-		timingsMap sql.NullString
-		status     string
-	}{
-		{
-			timingsMap: sql.NullString{
-				String: "[{\"generating_upload_schema\":\"2022-07-04T16:09:03.001Z\"},{\"generated_upload_schema\":\"2022-07-04T16:09:04.141Z\"},{\"creating_table_uploads\":\"2022-07-04T16:09:04.144Z\"},{\"created_table_uploads\":\"2022-07-04T16:09:04.164Z\"},{\"generating_load_files\":\"2022-07-04T16:09:04.169Z\"},{\"generated_load_files\":\"2022-07-04T16:09:40.957Z\"},{\"updating_table_uploads_counts\":\"2022-07-04T16:09:40.959Z\"},{\"updated_table_uploads_counts\":\"2022-07-04T16:09:41.916Z\"},{\"creating_remote_schema\":\"2022-07-04T16:09:41.918Z\"},{\"created_remote_schema\":\"2022-07-04T16:09:41.920Z\"},{\"exporting_data\":\"2022-07-04T16:09:41.922Z\"},{\"exporting_data_failed\":\"2022-07-04T17:14:24.424Z\"}]",
-			},
-			status: "exporting_data_failed",
-		},
-		{
-			timingsMap: sql.NullString{
-				String: "[]",
-			},
-			status: "",
-		},
-		{
-			timingsMap: sql.NullString{
-				String: "[{\"generating_upload_schema\":\"2022-07-04T16:09:03.001Z\"},{\"generated_upload_schema\":\"2022-07-04T16:09:04.141Z\"},{\"creating_table_uploads\":\"2022-07-04T16:09:04.144Z\"},{\"created_table_uploads\":\"2022-07-04T16:09:04.164Z\"}]",
-			},
-			status: "",
-		},
-	}
-	for _, input := range inputs {
-		status := GetLastFailedStatus(input.timingsMap)
-		require.Equal(t, status, input.status)
 	}
 }
 
@@ -602,12 +619,12 @@ func TestGetConfigValue(t *testing.T) {
 	inputs := []struct {
 		key       string
 		value     string
-		warehouse Warehouse
+		warehouse model.Warehouse
 	}{
 		{
 			key:   "k1",
 			value: "v1",
-			warehouse: Warehouse{
+			warehouse: model.Warehouse{
 				Destination: backendconfig.DestinationT{
 					Config: map[string]interface{}{
 						"k1": "v1",
@@ -617,13 +634,27 @@ func TestGetConfigValue(t *testing.T) {
 		},
 		{
 			key: "u1",
-			warehouse: Warehouse{
+			warehouse: model.Warehouse{
 				Destination: backendconfig.DestinationT{
 					Config: map[string]interface{}{},
 				},
 			},
 		},
+		{
+			key:   "u1",
+			value: "v1",
+			warehouse: model.Warehouse{
+				Source: backendconfig.SourceT{
+					ID: "source_id",
+				},
+				Destination: backendconfig.DestinationT{
+					ID:     "destination_id",
+					Config: map[string]interface{}{},
+				},
+			},
+		},
 	}
+	config.Set("Warehouse.pipeline.source_id.destination_id.u1", "v1")
 	for _, input := range inputs {
 		value := GetConfigValue(input.key, input.warehouse)
 		require.Equal(t, value, input.value)
@@ -634,12 +665,12 @@ func TestGetConfigValueBoolString(t *testing.T) {
 	inputs := []struct {
 		key       string
 		value     string
-		warehouse Warehouse
+		warehouse model.Warehouse
 	}{
 		{
 			key:   "k1",
 			value: "true",
-			warehouse: Warehouse{
+			warehouse: model.Warehouse{
 				Destination: backendconfig.DestinationT{
 					Config: map[string]interface{}{
 						"k1": true,
@@ -650,7 +681,7 @@ func TestGetConfigValueBoolString(t *testing.T) {
 		{
 			key:   "k1",
 			value: "false",
-			warehouse: Warehouse{
+			warehouse: model.Warehouse{
 				Destination: backendconfig.DestinationT{
 					Config: map[string]interface{}{
 						"k1": false,
@@ -661,7 +692,7 @@ func TestGetConfigValueBoolString(t *testing.T) {
 		{
 			key:   "u1",
 			value: "false",
-			warehouse: Warehouse{
+			warehouse: model.Warehouse{
 				Destination: backendconfig.DestinationT{
 					Config: map[string]interface{}{},
 				},
@@ -899,7 +930,7 @@ func TestGetTempFileExtension(t *testing.T) {
 			expected: "csv.gz",
 		},
 		{
-			destType: AZURE_SYNAPSE,
+			destType: AzureSynapse,
 			expected: "csv.gz",
 		},
 		{
@@ -907,15 +938,15 @@ func TestGetTempFileExtension(t *testing.T) {
 			expected: "csv.gz",
 		},
 		{
-			destType: S3_DATALAKE,
+			destType: S3Datalake,
 			expected: "csv.gz",
 		},
 		{
-			destType: GCS_DATALAKE,
+			destType: GCSDatalake,
 			expected: "csv.gz",
 		},
 		{
-			destType: AZURE_DATALAKE,
+			destType: AzureDatalake,
 			expected: "csv.gz",
 		},
 	}
@@ -925,77 +956,19 @@ func TestGetTempFileExtension(t *testing.T) {
 	}
 }
 
-func TestGetLoadFilePrefix(t *testing.T) {
-	inputs := []struct {
-		warehouse Warehouse
-		expected  string
-	}{
-		{
-			warehouse: Warehouse{
-				Destination: backendconfig.DestinationT{
-					Config: map[string]interface{}{
-						"tableSuffix": "key=val",
-					},
-				},
-				Type: S3_DATALAKE,
-			},
-			expected: "2022/08/06/14",
-		},
-		{
-			warehouse: Warehouse{
-				Destination: backendconfig.DestinationT{
-					Config: map[string]interface{}{
-						"tableSuffix": "key=val",
-					},
-				},
-				Type: AZURE_DATALAKE,
-			},
-			expected: "2022/08/06/14",
-		},
-		{
-			warehouse: Warehouse{
-				Destination: backendconfig.DestinationT{
-					Config: map[string]interface{}{
-						"tableSuffix": "key=val",
-					},
-				},
-				Type: GCS_DATALAKE,
-			},
-			expected: "key=val/2022/08/06/14",
-		},
-		{
-			warehouse: Warehouse{
-				Destination: backendconfig.DestinationT{
-					Config: map[string]interface{}{
-						"tableSuffix":      "key=val",
-						"timeWindowLayout": "year=2006/month=01/day=02/hour=15",
-					},
-				},
-				Type: GCS_DATALAKE,
-			},
-			expected: "key=val/year=2022/month=08/day=06/hour=14",
-		},
-	}
-	for _, input := range inputs {
-		timeWindow := time.Date(2022, time.Month(8), 6, 14, 10, 30, 0, time.UTC)
-		got := GetLoadFilePrefix(timeWindow, input.warehouse)
-		require.Equal(t, got, input.expected)
-	}
-}
-
 func TestWarehouseT_GetBoolDestinationConfig(t *testing.T) {
 	inputs := []struct {
-		warehouse Warehouse
+		warehouse model.Warehouse
 		expected  bool
 	}{
 		{
-			warehouse: Warehouse{
+			warehouse: model.Warehouse{
 				Destination: backendconfig.DestinationT{},
 			},
 			expected: false,
 		},
 		{
-			warehouse: Warehouse{
+			warehouse: model.Warehouse{
 				Destination: backendconfig.DestinationT{
 					Config: map[string]interface{}{},
 				},
@@ -1003,30 +976,30 @@ func TestWarehouseT_GetBoolDestinationConfig(t *testing.T) {
 			expected: false,
 		},
 		{
-			warehouse: Warehouse{
+			warehouse: model.Warehouse{
 				Destination: backendconfig.DestinationT{
 					Config: map[string]interface{}{
-						"k1": "true",
+						"useRudderStorage": "true",
 					},
 				},
 			},
 			expected: false,
 		},
 		{
-			warehouse: Warehouse{
+			warehouse: model.Warehouse{
 				Destination: backendconfig.DestinationT{
 					Config: map[string]interface{}{
-						"k1": false,
+						"useRudderStorage": false,
 					},
 				},
 			},
 			expected: false,
 		},
 		{
-			warehouse: Warehouse{
+			warehouse: model.Warehouse{
 				Destination: backendconfig.DestinationT{
 					Config: map[string]interface{}{
-						"k1": true,
+						"useRudderStorage": true,
 					},
 				},
 			},
@@ -1034,7 +1007,7 @@ func TestWarehouseT_GetBoolDestinationConfig(t *testing.T) {
 		},
 	}
 	for idx, input := range inputs {
-		got := input.warehouse.GetBoolDestinationConfig("k1")
+		got := input.warehouse.GetBoolDestinationConfig(model.UseRudderStorageSetting)
 		want := input.expected
 		if got != want {
 			t.Errorf("got %t expected %t input %d", got, want, idx)
@@ -1072,7 +1045,7 @@ func TestGetLoadFileFormat(t *testing.T) {
 			expected: "csv.gz",
 		},
 		{
-			whType:   AZURE_SYNAPSE,
+			whType:   AzureSynapse,
 			expected: "csv.gz",
 		},
 		{
@@ -1080,20 +1053,20 @@ func TestGetLoadFileFormat(t *testing.T) {
 			expected: "csv.gz",
 		},
 		{
-			whType:   S3_DATALAKE,
+			whType:   S3Datalake,
 			expected: "parquet",
 		},
 		{
-			whType:   GCS_DATALAKE,
+			whType:   GCSDatalake,
 			expected: "parquet",
 		},
 		{
-			whType:   AZURE_DATALAKE,
+			whType:   AzureDatalake,
 			expected: "parquet",
 		},
 	}
 	for _, input := range inputs {
-		got := GetLoadFileFormat(input.whType)
+		got := GetLoadFileFormat(GetLoadFileType(input.whType))
 		require.Equal(t, got, input.expected)
 	}
 }
@@ -1128,7 +1101,7 @@ func TestGetLoadFileType(t *testing.T) {
 			expected: "csv",
 		},
 		{
-			whType:   AZURE_SYNAPSE,
+			whType:   AzureSynapse,
 			expected: "csv",
 		},
 		{
@@ -1136,15 +1109,15 @@ func TestGetLoadFileType(t *testing.T) {
 			expected: "csv",
 		},
 		{
-			whType:   S3_DATALAKE,
+			whType:   S3Datalake,
 			expected: "parquet",
 		},
 		{
-			whType:   GCS_DATALAKE,
+			whType:   GCSDatalake,
 			expected: "parquet",
 		},
 		{
-			whType:   AZURE_DATALAKE,
+			whType:   AzureDatalake,
 			expected: "parquet",
 		},
 	}
@@ -1204,7 +1177,7 @@ func TestCreateAWSSessionConfig(t *testing.T) {
 	inputs := []struct {
 		destination    *backendconfig.DestinationT
 		service        string
-		expectedConfig *awsutils.SessionConfig
+		expectedConfig *awsutil.SessionConfig
 	}{
 		{
 			destination: &backendconfig.DestinationT{
@@ -1213,7 +1186,7 @@ func TestCreateAWSSessionConfig(t *testing.T) {
 				},
 			},
 			service: "s3",
-			expectedConfig: &awsutils.SessionConfig{
+			expectedConfig: &awsutil.SessionConfig{
 				AccessKeyID: rudderAccessKeyID,
 				AccessKey:   rudderAccessKey,
 				Service:     "s3",
@@ -1227,7 +1200,7 @@ func TestCreateAWSSessionConfig(t *testing.T) {
 				},
 			},
 			service: "glue",
-			expectedConfig: &awsutils.SessionConfig{
+			expectedConfig: &awsutil.SessionConfig{
 				AccessKeyID: someAccessKeyID,
 				AccessKey:   someAccessKey,
 				Service:     "glue",
@@ -1241,7 +1214,7 @@ func TestCreateAWSSessionConfig(t *testing.T) {
 				WorkspaceID: someWorkspaceID,
 			},
 			service: "redshift",
-			expectedConfig: &awsutils.SessionConfig{
+			expectedConfig: &awsutil.SessionConfig{
 				RoleBasedAuth: true,
 				IAMRoleARN:    someIAMRoleARN,
 				ExternalID:    someWorkspaceID,
@@ -1254,7 +1227,7 @@ func TestCreateAWSSessionConfig(t *testing.T) {
 				WorkspaceID: someWorkspaceID,
 			},
 			service: "redshift",
-			expectedConfig: &awsutils.SessionConfig{
+			expectedConfig: &awsutil.SessionConfig{
 				AccessKeyID: rudderAccessKeyID,
 				AccessKey:   rudderAccessKey,
 				Service:     "redshift",
@@ -1269,20 +1242,20 @@ func TestCreateAWSSessionConfig(t *testing.T) {
 }
 
 var _ = Describe("Utils", func() {
-	DescribeTable("Get columns from table schema", func(schema TableSchemaT, expected []string) {
+	DescribeTable("Get columns from table schema", func(schema model.TableSchema, expected []string) {
 		columns := GetColumnsFromTableSchema(schema)
 		sort.Strings(columns)
 		sort.Strings(expected)
 		Expect(columns).To(Equal(expected))
 	},
-		Entry(nil, TableSchemaT{"k1": "v1", "k2": "v2"}, []string{"k1", "k2"}),
-		Entry(nil, TableSchemaT{"k2": "v1", "k1": "v2"}, []string{"k2", "k1"}),
+		Entry(nil, model.TableSchema{"k1": "v1", "k2": "v2"}, []string{"k1", "k2"}),
+		Entry(nil, model.TableSchema{"k2": "v1", "k1": "v2"}, []string{"k2", "k1"}),
 	)
 
-	DescribeTable("JSON schema to Map", func(rawMsg json.RawMessage, expected map[string]map[string]string) {
+	DescribeTable("JSON schema to Map", func(rawMsg json.RawMessage, expected model.Schema) {
 		Expect(JSONSchemaToMap(rawMsg)).To(Equal(expected))
 	},
-		Entry(nil, json.RawMessage(`{"k1": { "k2": "v2" }}`), map[string]map[string]string{"k1": {"k2": "v2"}}),
+		Entry(nil, json.RawMessage(`{"k1": { "k2": "v2" }}`), model.Schema{"k1": {"k2": "v2"}}),
 	)
 
 	DescribeTable("Get date range list", func(start, end time.Time, format string, expected []string) {
@@ -1302,11 +1275,11 @@ var _ = Describe("Utils", func() {
 		Entry(nil, POSTGRES),
 		Entry(nil, CLICKHOUSE),
 		Entry(nil, MSSQL),
-		Entry(nil, AZURE_SYNAPSE),
+		Entry(nil, AzureSynapse),
 		Entry(nil, DELTALAKE),
-		Entry(nil, S3_DATALAKE),
-		Entry(nil, GCS_DATALAKE),
-		Entry(nil, AZURE_DATALAKE),
+		Entry(nil, S3Datalake),
+		Entry(nil, GCSDatalake),
+		Entry(nil, AzureDatalake),
 	)
 
 	DescribeTable("Staging table name", func(provider string, limit int) {
@@ -1326,29 +1299,29 @@ var _ = Describe("Utils", func() {
 		Entry(nil, POSTGRES, 63),
 		Entry(nil, CLICKHOUSE, 127),
 		Entry(nil, MSSQL, 127),
-		Entry(nil, AZURE_SYNAPSE, 127),
+		Entry(nil, AzureSynapse, 127),
 		Entry(nil, DELTALAKE, 127),
-		Entry(nil, S3_DATALAKE, 127),
-		Entry(nil, GCS_DATALAKE, 127),
-		Entry(nil, AZURE_DATALAKE, 127),
+		Entry(nil, S3Datalake, 127),
+		Entry(nil, GCSDatalake, 127),
+		Entry(nil, AzureDatalake, 127),
 	)
 
-	DescribeTable("Identity mapping unique mapping constraints name", func(warehouse Warehouse, expected string) {
+	DescribeTable("Identity mapping unique mapping constraints name", func(warehouse model.Warehouse, expected string) {
 		Expect(IdentityMappingsUniqueMappingConstraintName(warehouse)).To(Equal(expected))
 	},
-		Entry(nil, Warehouse{Namespace: "namespace", Destination: backendconfig.DestinationT{ID: "id"}}, "unique_merge_property_namespace_id"),
+		Entry(nil, model.Warehouse{Namespace: "namespace", Destination: backendconfig.DestinationT{ID: "id"}}, "unique_merge_property_namespace_id"),
 	)
 
-	DescribeTable("Identity mapping table name", func(warehouse Warehouse, expected string) {
+	DescribeTable("Identity mapping table name", func(warehouse model.Warehouse, expected string) {
 		Expect(IdentityMappingsTableName(warehouse)).To(Equal(expected))
 	},
-		Entry(nil, Warehouse{Namespace: "namespace", Destination: backendconfig.DestinationT{ID: "id"}}, "rudder_identity_mappings_namespace_id"),
+		Entry(nil, model.Warehouse{Namespace: "namespace", Destination: backendconfig.DestinationT{ID: "id"}}, "rudder_identity_mappings_namespace_id"),
 	)
 
-	DescribeTable("Identity merge rules table name", func(warehouse Warehouse, expected string) {
+	DescribeTable("Identity merge rules table name", func(warehouse model.Warehouse, expected string) {
 		Expect(IdentityMergeRulesTableName(warehouse)).To(Equal(expected))
 	},
-		Entry(nil, Warehouse{Namespace: "namespace", Destination: backendconfig.DestinationT{ID: "id"}}, "rudder_identity_merge_rules_namespace_id"),
+		Entry(nil, model.Warehouse{Namespace: "namespace", Destination: backendconfig.DestinationT{ID: "id"}}, "rudder_identity_merge_rules_namespace_id"),
 	)
 
 	DescribeTable("Identity merge rules warehouse table name", func(provider string) {
@@ -1360,11 +1333,11 @@ var _ = Describe("Utils", func() {
 		Entry(nil, POSTGRES),
 		Entry(nil, CLICKHOUSE),
 		Entry(nil, MSSQL),
-		Entry(nil, AZURE_SYNAPSE),
+		Entry(nil, AzureSynapse),
 		Entry(nil, DELTALAKE),
-		Entry(nil, S3_DATALAKE),
-		Entry(nil, GCS_DATALAKE),
-		Entry(nil, AZURE_DATALAKE),
+		Entry(nil, S3Datalake),
+		Entry(nil, GCSDatalake),
+		Entry(nil, AzureDatalake),
 	)
 
 	DescribeTable("Identity mappings warehouse table name", func(provider string) {
@@ -1376,11 +1349,11 @@ var _ = Describe("Utils", func() {
 		Entry(nil, POSTGRES),
 		Entry(nil, CLICKHOUSE),
 		Entry(nil, MSSQL),
-		Entry(nil, AZURE_SYNAPSE),
+		Entry(nil, AzureSynapse),
 		Entry(nil, DELTALAKE),
-		Entry(nil, S3_DATALAKE),
-		Entry(nil, GCS_DATALAKE),
-		Entry(nil, AZURE_DATALAKE),
+		Entry(nil, S3Datalake),
+		Entry(nil, GCSDatalake),
+		Entry(nil, AzureDatalake),
 	)
 
 	DescribeTable("Get object name", func(location string, config interface{}, objectProvider, objectName string) {
@@ -1388,7 +1361,7 @@ var _ = Describe("Utils", func() {
 	},
 		Entry(GCS, "https://storage.googleapis.com/bucket-name/key", map[string]interface{}{"bucketName": "bucket-name"}, GCS, "key"),
 		Entry(S3, "https://bucket-name.s3.amazonaws.com/key", map[string]interface{}{"bucketName": "bucket-name"}, S3, "key"),
-		Entry(AZURE_BLOB, "https://account-name.blob.core.windows.net/container-name/key", map[string]interface{}{"containerName": "container-name"}, AZURE_BLOB, "key"),
+		Entry(AzureBlob, "https://account-name.blob.core.windows.net/container-name/key", map[string]interface{}{"containerName": "container-name"}, AzureBlob, "key"),
 		Entry(MINIO, "https://minio-endpoint/bucket-name/key", map[string]interface{}{"bucketName": "bucket-name", "useSSL": true, "endPoint": "minio-endpoint"}, MINIO, "key"),
 	)
 

@@ -6,10 +6,11 @@ import (
 	"testing"
 	"time"
 
+	"github.com/stretchr/testify/require"
+
+	"github.com/rudderlabs/rudder-go-kit/logger"
 	suppression "github.com/rudderlabs/rudder-server/enterprise/suppress-user"
 	"github.com/rudderlabs/rudder-server/enterprise/suppress-user/model"
-	"github.com/rudderlabs/rudder-server/utils/logger"
-	"github.com/stretchr/testify/require"
 )
 
 func BenchmarkAddAndSuppress(b *testing.B) {
@@ -83,10 +84,6 @@ func generateSuppressions(startFrom, batchSize int) []model.Suppression {
 		})
 	}
 	return res
-}
-
-func init() {
-	rand.Seed(time.Now().UnixNano())
 }
 
 func randomInt(lt int) int {

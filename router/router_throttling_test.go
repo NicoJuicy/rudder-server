@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/signal"
 	"reflect"
+	"sort"
 	"strconv"
 	"sync"
 	"sync/atomic"
@@ -17,15 +18,19 @@ import (
 	"time"
 
 	"github.com/ory/dockertest/v3"
+	"github.com/samber/lo"
 	"github.com/stretchr/testify/require"
 	"golang.org/x/sync/errgroup"
 
+	"github.com/rudderlabs/rudder-go-kit/bytesize"
+	kithttputil "github.com/rudderlabs/rudder-go-kit/httputil"
+	kithelper "github.com/rudderlabs/rudder-go-kit/testhelper"
+	"github.com/rudderlabs/rudder-go-kit/testhelper/docker/resource/postgres"
+	trand "github.com/rudderlabs/rudder-go-kit/testhelper/rand"
 	"github.com/rudderlabs/rudder-server/runner"
 	"github.com/rudderlabs/rudder-server/testhelper"
 	"github.com/rudderlabs/rudder-server/testhelper/destination"
 	"github.com/rudderlabs/rudder-server/testhelper/health"
-	trand "github.com/rudderlabs/rudder-server/testhelper/rand"
-	"github.com/rudderlabs/rudder-server/utils/httputil"
 )
 
 func Test_RouterThrottling(t *testing.T) {
@@ -78,11 +83,11 @@ func Test_RouterThrottling(t *testing.T) {
 	require.NoError(t, err)
 	var (
 		group                errgroup.Group
-		postgresContainer    *destination.PostgresResource
+		postgresContainer    *postgres.Resource
 		transformerContainer *destination.TransformerResource
 	)
 	group.Go(func() (err error) {
-		postgresContainer, err = destination.SetupPostgres(pool, t)
+		postgresContainer, err = postgres.Setup(pool, t, postgres.WithShmSize(256*bytesize.MB))
 		return
 	})
 	group.Go(func() (err error) {
@@ -105,11 +110,11 @@ func Test_RouterThrottling(t *testing.T) {
 		"workspaceId": workspaceID,
 	})
 
-	httpPort, err := testhelper.GetFreePort()
+	httpPort, err := kithelper.GetFreePort()
 	require.NoError(t, err)
-	httpAdminPort, err := testhelper.GetFreePort()
+	httpAdminPort, err := kithelper.GetFreePort()
 	require.NoError(t, err)
-	debugPort, err := testhelper.GetFreePort()
+	debugPort, err := kithelper.GetFreePort()
 	require.NoError(t, err)
 	rudderTmpDir, err := os.MkdirTemp("", "rudder_server_*_test")
 	require.NoError(t, err)
@@ -203,7 +208,7 @@ func Test_RouterThrottling(t *testing.T) {
 		resp, err := client.Do(req)
 		require.NoError(t, err, "should be able to send the request to gateway")
 		require.Equal(t, http.StatusOK, resp.StatusCode)
-		func() { httputil.CloseResponse(resp) }()
+		func() { kithttputil.CloseResponse(resp) }()
 	}
 
 	require.Eventuallyf(t,
@@ -215,18 +220,25 @@ func Test_RouterThrottling(t *testing.T) {
 		atomic.LoadInt64(webhook1.count), atomic.LoadInt64(webhook2.count),
 	)
 
-	// with 100 events, 20 rps and a cost of 2 we expect 10-11 buckets tops
-	requireLengthInRange(t, webhook1.buckets, 10, 11)
-	for _, rate := range webhook1.buckets {
-		// throttling cost is 2 and rate is 20 per second, so we expect ~10 in each bucket
-		require.LessOrEqual(t, rate, 10)
+	verifyBucket := func(buckets map[int64]int, totalEvents, rps, cost int) {
+		lowerLengthRange := (totalEvents * cost) / rps
+		upperLengthRange := lowerLengthRange + 2
+		requireLengthInRange(t, buckets, lowerLengthRange, upperLengthRange)
+
+		maxEventsPerBucket := rps / cost
+		bucketKeys := lo.Map(lo.Keys(buckets), func(key int64, _ int) int {
+			return int(key)
+		})
+		sort.Ints(bucketKeys)
+		bucketKeys = lo.Drop(bucketKeys, 1) // drop the first bucket (burst)
+		for bucketKey := range bucketKeys {
+			rate := buckets[int64(bucketKey)]
+			require.LessOrEqual(t, rate, maxEventsPerBucket)
+		}
 	}
-	// with 100 events, 50 rps and a cost of 2 we expect 4-5 buckets tops
-	requireLengthInRange(t, webhook2.buckets, 4, 5)
-	for _, rate := range webhook2.buckets {
-		// throttling cost is 2 and rate is 50 per second, so we expect 25 in each bucket
-		require.LessOrEqual(t, rate, 25)
-	}
+
+	verifyBucket(webhook1.buckets, noOfEvents, 20, 2)
+	verifyBucket(webhook2.buckets, noOfEvents, 50, 2)
 }
 
 func requireLengthInRange(t *testing.T, x interface{}, min, max int) {

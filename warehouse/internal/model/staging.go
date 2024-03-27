@@ -25,8 +25,6 @@ type StagingFile struct {
 	TotalEvents           int
 	TotalBytes            int
 	// cloud sources specific info
-	SourceBatchID   string
-	SourceTaskID    string
 	SourceTaskRunID string
 	SourceJobID     string
 	SourceJobRunID  string
@@ -38,7 +36,7 @@ type StagingFile struct {
 
 // StagingFileWithSchema is a StagingFile with schema field for included events.
 //
-//	schema size can be really big, and thus it should be included only when required.
+//	schema size can be huge, and thus it should be included only when required.
 type StagingFileWithSchema struct {
 	StagingFile
 	Schema json.RawMessage

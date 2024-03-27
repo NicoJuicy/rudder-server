@@ -3,22 +3,25 @@ package types
 import (
 	"database/sql"
 	"encoding/json"
+	"time"
 )
 
-type Config struct {
-	ClientName string
-	ConnInfo   string
+type SyncerConfig struct {
+	ConnInfo string
+	Label    string
 }
 
 const (
-	CoreReportingClient      = "core"
-	WarehouseReportingClient = "warehouse"
+	CoreReportingLabel      = "core"
+	WarehouseReportingLabel = "warehouse"
 
 	SupportedTransformerApiVersion = 2
 
 	DefaultReportingEnabled = true
 	DefaultReplayEnabled    = false
 )
+
+const MaxLengthExceeded = ":max-length-exceeded:"
 
 var (
 	DiffStatus = "diff"
@@ -35,19 +38,33 @@ var (
 	WAREHOUSE              = "warehouse"
 )
 
-type Client struct {
-	Config
+var (
+	// Tracking plan validation states
+	SUCCEEDED_WITHOUT_VIOLATIONS = "succeeded_without_violations"
+	SUCCEEDED_WITH_VIOLATIONS    = "succeeded_with_violations"
+)
+
+type SyncSource struct {
+	SyncerConfig
 	DbHandle *sql.DB
 }
 
 type StatusDetail struct {
-	Status         string          `json:"state"`
-	Count          int64           `json:"count"`
-	StatusCode     int             `json:"statusCode"`
-	SampleResponse string          `json:"sampleResponse"`
-	SampleEvent    json.RawMessage `json:"sampleEvent"`
-	EventName      string          `json:"eventName"`
-	EventType      string          `json:"eventType"`
+	Status         string           `json:"state"`
+	Count          int64            `json:"count"`
+	StatusCode     int              `json:"statusCode"`
+	SampleResponse string           `json:"sampleResponse"`
+	SampleEvent    json.RawMessage  `json:"sampleEvent"`
+	EventName      string           `json:"eventName"`
+	EventType      string           `json:"eventType"`
+	ErrorType      string           `json:"errorType"`
+	ViolationCount int64            `json:"violationCount"`
+	FailedMessages []*FailedMessage `json:"-"`
+}
+
+type FailedMessage struct {
+	MessageID  string    `json:"messageId"`
+	ReceivedAt time.Time `json:"receivedAt"`
 }
 
 type ReportByStatus struct {
@@ -76,17 +93,67 @@ type Metric struct {
 	StatusDetails []*StatusDetail `json:"reports"`
 }
 
+// EDMetric => ErrorDetailMetric
+type EDConnectionDetails struct {
+	SourceID                string `json:"sourceId"`
+	DestinationID           string `json:"destinationId"`
+	SourceDefinitionId      string `json:"sourceDefinitionId"`
+	DestinationDefinitionId string `json:"destinationDefinitionId"`
+	DestType                string `json:"destinationDefinitionName"`
+}
+
+type EDInstanceDetails struct {
+	WorkspaceID string `json:"workspaceId"`
+	Namespace   string `json:"namespace"`
+	InstanceID  string `json:"-"`
+}
+
+type EDErrorDetails struct {
+	StatusCode   int    `json:"statusCode"`
+	ErrorCode    string `json:"errorCode"`
+	ErrorMessage string `json:"errorMessage"`
+	// TODO: need to check with team if this makes sense ?
+	EventType string `json:"-"`
+	Count     int64  `json:"count"`
+}
+
+type EDReportsDB struct {
+	EDErrorDetails
+	EDInstanceDetails
+	EDConnectionDetails
+	ReportMetadata
+
+	PU    string `json:"reportedBy"`
+	Count int64  `json:"-"`
+}
+
+// EDMetric The structure in which the error detail data is being sent to reporting service
+type EDMetric struct {
+	EDInstanceDetails
+	PU string `json:"reportedBy"`
+
+	ReportMetadata
+
+	EDConnectionDetails
+
+	Errors []EDErrorDetails `json:"errors"`
+
+	Count int64 `json:"-"`
+}
+
 type ConnectionDetails struct {
 	SourceID                string `json:"sourceId"`
 	DestinationID           string `json:"destinationId"`
-	SourceBatchID           string `json:"sourceBatchId"`
-	SourceTaskID            string `json:"sourceTaskId"`
 	SourceTaskRunID         string `json:"sourceTaskRunId"`
 	SourceJobID             string `json:"sourceJobId"`
 	SourceJobRunID          string `json:"sourceJobRunId"`
 	SourceDefinitionId      string `json:"sourceDefinitionId"`
 	DestinationDefinitionId string `string:"destinationDefinitionId"`
 	SourceCategory          string `json:"sourceCategory"`
+	TransformationID        string `json:"transformationId"`
+	TransformationVersionID string `json:"transformationVersionId"`
+	TrackingPlanID          string `json:"trackingPlanId"`
+	TrackingPlanVersion     int    `json:"trackingPlanVersion"`
 }
 type PUDetails struct {
 	InPU       string `json:"inReportedBy"`
@@ -101,30 +168,34 @@ type PUReportedMetric struct {
 	StatusDetail *StatusDetail
 }
 
-func CreateConnectionDetail(sid, did, sbid, stid, strid, sjid, sjrid, sdid, ddid, sc string) *ConnectionDetails {
+func CreateConnectionDetail(sid, did, strid, sjid, sjrid, sdid, ddid, sc, trid, trvid, tpid string, tpv int) *ConnectionDetails {
 	return &ConnectionDetails{
 		SourceID:                sid,
 		DestinationID:           did,
-		SourceBatchID:           sbid,
-		SourceTaskID:            stid,
 		SourceTaskRunID:         strid,
 		SourceJobID:             sjid,
 		SourceJobRunID:          sjrid,
 		SourceDefinitionId:      sdid,
 		DestinationDefinitionId: ddid,
 		SourceCategory:          sc,
+		TransformationID:        trid,
+		TransformationVersionID: trvid,
+		TrackingPlanID:          tpid,
+		TrackingPlanVersion:     tpv,
 	}
 }
 
-func CreateStatusDetail(status string, count int64, code int, resp string, event json.RawMessage, eventName, eventType string) *StatusDetail {
+func CreateStatusDetail(status string, count, violationCount int64, code int, resp string, event json.RawMessage, eventName, eventType, errorType string) *StatusDetail {
 	return &StatusDetail{
 		Status:         status,
 		Count:          count,
+		ViolationCount: violationCount,
 		StatusCode:     code,
 		SampleResponse: resp,
 		SampleEvent:    event,
 		EventName:      eventName,
 		EventType:      eventType,
+		ErrorType:      errorType,
 	}
 }
 
@@ -137,7 +208,7 @@ func CreatePUDetails(inPU, pu string, terminalPU, initialPU bool) *PUDetails {
 	}
 }
 
-func AssertSameKeys(m1 map[string]*ConnectionDetails, m2 map[string]*StatusDetail) {
+func AssertSameKeys[V1, V2 any](m1 map[string]V1, m2 map[string]V2) {
 	if len(m1) != len(m2) {
 		panic("maps length don't match") // TODO improve msg
 	}

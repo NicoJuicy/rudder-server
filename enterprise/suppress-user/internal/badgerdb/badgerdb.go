@@ -1,6 +1,7 @@
 package badgerdb
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -9,11 +10,14 @@ import (
 	"sync"
 	"time"
 
-	"github.com/dgraph-io/badger/v3"
-	"github.com/dgraph-io/badger/v3/options"
-	"github.com/rudderlabs/rudder-server/enterprise/suppress-user/model"
-	"github.com/rudderlabs/rudder-server/utils/logger"
+	badger "github.com/dgraph-io/badger/v4"
+	"github.com/dgraph-io/badger/v4/options"
 	"github.com/samber/lo"
+
+	"github.com/rudderlabs/rudder-go-kit/logger"
+	"github.com/rudderlabs/rudder-go-kit/stats"
+	"github.com/rudderlabs/rudder-server/enterprise/suppress-user/model"
+	"github.com/rudderlabs/rudder-server/utils/misc"
 )
 
 // the key used in badgerdb to store the current token
@@ -23,7 +27,7 @@ const tokenKey = "__token__"
 type Opt func(*Repository)
 
 // WithSeederSource sets the source of the seed data
-func WithSeederSource(seederSource func() (io.Reader, error)) Opt {
+func WithSeederSource(seederSource func() (io.ReadCloser, error)) Opt {
 	return func(r *Repository) {
 		r.seederSource = seederSource
 	}
@@ -48,7 +52,7 @@ type Repository struct {
 	maxGoroutines int
 
 	maxSeedWait  time.Duration
-	seederSource func() (io.Reader, error)
+	seederSource func() (io.ReadCloser, error)
 
 	db *badger.DB
 
@@ -57,21 +61,23 @@ type Repository struct {
 	restoring     bool
 	closeOnce     sync.Once
 	closed        chan struct{}
+	stats         stats.Stats
 }
 
 // NewRepository returns a new repository backed by badgerdb.
-func NewRepository(basePath string, log logger.Logger, opts ...Opt) (*Repository, error) {
+func NewRepository(basePath string, log logger.Logger, stats stats.Stats, opts ...Opt) (*Repository, error) {
 	b := &Repository{
 		log:           log,
-		path:          path.Join(basePath, "badgerdbv3"),
+		path:          path.Join(basePath, "badgerdbv4"),
 		maxGoroutines: 1,
 		maxSeedWait:   10 * time.Second,
+		stats:         stats,
 	}
 	for _, opt := range opts {
 		opt(b)
 	}
-
-	return b, b.start()
+	err := b.start()
+	return b, err
 }
 
 // GetToken returns the current token
@@ -92,7 +98,7 @@ func (b *Repository) GetToken() ([]byte, error) {
 			return fmt.Errorf("could not get token: %w", err)
 		}
 		if err = item.Value(func(val []byte) error {
-			token = val
+			token = append([]byte{}, val...)
 			return nil
 		}); err != nil {
 			return fmt.Errorf("could not get token value: %w", err)
@@ -106,39 +112,43 @@ func (b *Repository) GetToken() ([]byte, error) {
 }
 
 // Suppressed returns true if the given user is suppressed, false otherwise
-func (b *Repository) Suppressed(workspaceID, userID, sourceID string) (bool, error) {
+func (b *Repository) Suppressed(workspaceID, userID, sourceID string) (*model.Metadata, error) {
 	b.restoringLock.RLock()
 	defer b.restoringLock.RUnlock()
 	if b.restoring {
-		return false, model.ErrRestoring
+		return nil, model.ErrRestoring
 	}
 	if b.db.IsClosed() {
-		return false, badger.ErrDBClosed
+		return nil, badger.ErrDBClosed
 	}
 
 	keyPrefix := keyPrefix(workspaceID, userID)
+	var metadata *model.Metadata
 	err := b.db.View(func(txn *badger.Txn) error {
 		wildcardKey := keyPrefix + model.Wildcard
-		_, err := txn.Get([]byte(wildcardKey))
+		item, err := txn.Get([]byte(wildcardKey))
 		if err == nil {
-			return nil
+			metadata, err = getMetadataFromBadgerItem(item)
+			return err
 		}
 		if !errors.Is(err, badger.ErrKeyNotFound) {
 			return fmt.Errorf("could not get wildcard key %s: %w", wildcardKey, err)
 		}
 		sourceKey := keyPrefix + sourceID
-		if _, err = txn.Get([]byte(sourceKey)); err != nil {
+		item, err = txn.Get([]byte(sourceKey))
+		if err != nil {
 			return fmt.Errorf("could not get sourceID key %s: %w", sourceKey, err)
 		}
+		metadata, err = getMetadataFromBadgerItem(item)
 		return err
 	})
 	if err != nil {
 		if errors.Is(err, badger.ErrKeyNotFound) {
-			return false, nil
+			return nil, model.ErrKeyNotFound
 		}
-		return false, err
+		return nil, err
 	}
-	return true, nil
+	return metadata, nil
 }
 
 // Add adds the given suppressions to the repository
@@ -171,7 +181,15 @@ func (b *Repository) Add(suppressions []model.Suppression, token []byte) error {
 			if suppression.Canceled {
 				err = wb.Delete([]byte(key))
 			} else {
-				err = wb.Set([]byte(key), []byte(""))
+				var value []byte
+				metadata := model.Metadata{
+					CreatedAt: suppression.CreatedAt,
+				}
+				value, err = json.Marshal(metadata)
+				if err != nil {
+					return fmt.Errorf("could not marshal suppression metadata: %w", err)
+				}
+				err = wb.Set([]byte(key), value)
 			}
 			if err != nil {
 				return fmt.Errorf("could not add key %s (canceled:%t) in write batch: %w", key, suppression.Canceled, err)
@@ -189,13 +207,18 @@ func (b *Repository) Add(suppressions []model.Suppression, token []byte) error {
 }
 
 // start the repository
-func (b *Repository) start() error {
+func (b *Repository) start() (startErr error) {
 	b.closed = make(chan struct{})
-	var seeder io.Reader
+	var seeder io.ReadCloser
 	if _, err := os.Stat(b.path); os.IsNotExist(err) && b.seederSource != nil {
 		if seeder, err = b.seederSource(); err != nil {
 			return err
 		}
+		defer func() {
+			if startErr != nil && seeder != nil {
+				_ = seeder.Close()
+			}
+		}()
 	}
 
 	opts := badger.
@@ -204,14 +227,15 @@ func (b *Repository) start() error {
 		WithCompression(options.None).
 		WithIndexCacheSize(16 << 20). // 16mb
 		WithNumGoroutines(b.maxGoroutines)
-	var err error
-	b.db, err = badger.Open(opts)
-	if err != nil {
-		return err
+	b.db, startErr = badger.Open(opts)
+	if startErr != nil {
+		startErr = fmt.Errorf("could not open badgerdb: %w", startErr)
+		return startErr
 	}
 
 	if seeder != nil {
 		restoreDone := lo.Async(func() error {
+			defer func() { _ = seeder.Close() }()
 			if err := b.Restore(seeder); err != nil {
 				b.log.Error("Failed to restore badgerdb", "error", err)
 				return err
@@ -219,7 +243,11 @@ func (b *Repository) start() error {
 			return nil
 		})
 		select {
-		case <-restoreDone:
+		case startErr = <-restoreDone:
+			if startErr != nil {
+				startErr = fmt.Errorf("could not restore badgerdb: %w", startErr)
+				return startErr
+			}
 		case <-time.After(b.maxSeedWait):
 			b.log.Warn("Badgerdb still restoring after %s, proceeding...", b.maxSeedWait)
 		}
@@ -239,6 +267,15 @@ func (b *Repository) start() error {
 			if err == nil {
 				goto again
 			}
+			lsmSize, vlogSize, totSize, err := misc.GetBadgerDBUsage(b.db.Opts().Dir)
+			if err != nil {
+				b.log.Errorf("Error while getting badgerDB usage: %v", err)
+				continue
+			}
+			statName := "suppress-user"
+			b.stats.NewTaggedStat("badger_db_size", stats.GaugeType, stats.Tags{"name": statName, "type": "lsm"}).Gauge(lsmSize)
+			b.stats.NewTaggedStat("badger_db_size", stats.GaugeType, stats.Tags{"name": statName, "type": "vlog"}).Gauge(vlogSize)
+			b.stats.NewTaggedStat("badger_db_size", stats.GaugeType, stats.Tags{"name": statName, "type": "total"}).Gauge(totSize)
 		}
 	}()
 	return nil
@@ -308,4 +345,20 @@ func (l blogger) Warningf(fmt string, args ...interface{}) {
 
 func keyPrefix(workspaceID, userID string) string {
 	return fmt.Sprintf("%s:%s:", workspaceID, userID)
+}
+
+func getMetadataFromBadgerItem(item *badger.Item) (*model.Metadata, error) {
+	itemValue, err := item.ValueCopy(nil)
+	if err != nil {
+		return nil, fmt.Errorf("could not copy item value: %w", err)
+	}
+	var metadata model.Metadata
+	if len(itemValue) == 0 { // backwards compatibility
+		return &metadata, nil
+	}
+	err = json.Unmarshal(itemValue, &metadata)
+	if err != nil {
+		return nil, fmt.Errorf("could not unmarshal metadata: %w", err)
+	}
+	return &metadata, nil
 }

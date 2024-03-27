@@ -1,13 +1,16 @@
 package loadfiles_test
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
 	"testing"
 
-	"github.com/rudderlabs/rudder-server/services/pgnotifier"
-	"github.com/rudderlabs/rudder-server/warehouse/internal/loadfiles"
-	warehouseutils "github.com/rudderlabs/rudder-server/warehouse/utils"
+	"github.com/rudderlabs/rudder-server/services/notifier"
+
 	"github.com/stretchr/testify/require"
+
+	"github.com/rudderlabs/rudder-server/warehouse/internal/loadfiles"
 )
 
 type mockNotifier struct {
@@ -17,20 +20,20 @@ type mockNotifier struct {
 	tables   []string
 }
 
-func (n *mockNotifier) Publish(payload pgnotifier.MessagePayload, schema *warehouseutils.SchemaT, priority int) (chan []pgnotifier.ResponseT, error) {
-	var responses []pgnotifier.ResponseT
-	for _, p := range payload.Jobs {
+func (n *mockNotifier) Publish(_ context.Context, payload *notifier.PublishRequest) (<-chan *notifier.PublishResponse, error) {
+	var responses notifier.PublishResponse
+	for _, p := range payload.Payloads {
 		var req loadfiles.WorkerJobRequest
 		err := json.Unmarshal(p, &req)
 		require.NoError(n.t, err)
 
-		var resps []loadfiles.WorkerJobResponse
+		var loadFileUploads []loadfiles.LoadFileUpload
 		for _, tableName := range n.tables {
 			destinationRevisionID := req.DestinationRevisionID
 
 			n.requests = append(n.requests, req)
 
-			resps = append(resps, loadfiles.WorkerJobResponse{
+			loadFileUploads = append(loadFileUploads, loadfiles.LoadFileUpload{
 				TableName:             tableName,
 				Location:              req.StagingFileLocation + "/" + req.UniqueLoadGenID + "/" + tableName,
 				TotalRows:             10,
@@ -40,28 +43,31 @@ func (n *mockNotifier) Publish(payload pgnotifier.MessagePayload, schema *wareho
 				UseRudderStorage:      req.UseRudderStorage,
 			})
 		}
-		out, err := json.Marshal(resps)
+		jobResponse := loadfiles.WorkerJobResponse{
+			StagingFileID: req.StagingFileID,
+			Output:        loadFileUploads,
+		}
+		out, err := json.Marshal(jobResponse)
 
 		errString := ""
 		if err != nil {
 			errString = err.Error()
 		}
 
-		status := "ok"
+		status := notifier.Succeeded
 		if req.StagingFileLocation == "" {
 			errString = "staging file location is empty"
-			status = "aborted"
+			status = notifier.Aborted
 		}
 
-		responses = append(responses, pgnotifier.ResponseT{
-			JobID:  req.StagingFileID,
-			Output: json.RawMessage(out),
-			Error:  errString,
-			Status: status,
+		responses.Jobs = append(responses.Jobs, notifier.Job{
+			Payload: out,
+			Error:   errors.New(errString),
+			Status:  status,
 		})
 	}
 
-	ch := make(chan []pgnotifier.ResponseT, 1)
-	ch <- responses
+	ch := make(chan *notifier.PublishResponse, 1)
+	ch <- &responses
 	return ch, nil
 }

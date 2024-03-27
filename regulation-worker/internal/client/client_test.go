@@ -9,11 +9,12 @@ import (
 	"testing"
 	"time"
 
+	"github.com/stretchr/testify/require"
+
 	"github.com/rudderlabs/rudder-server/regulation-worker/internal/client"
 	"github.com/rudderlabs/rudder-server/regulation-worker/internal/model"
 	"github.com/rudderlabs/rudder-server/services/controlplane/identity"
 	"github.com/rudderlabs/rudder-server/utils/types/deployment"
-	"github.com/stretchr/testify/require"
 )
 
 func TestGet(t *testing.T) {
@@ -146,9 +147,9 @@ func TestUpdateStatus(t *testing.T) {
 		{
 			name:            "DEDICATED MODE: update status request: successful",
 			workspaceID:     "1001",
-			status:          model.JobStatusComplete,
+			status:          model.JobStatus{Status: model.JobStatusComplete},
 			jobID:           1,
-			expectedReqBody: `{"status":"complete"}`,
+			expectedReqBody: `{"status":"complete","reason":""}`,
 			respCode:        201,
 			mode:            deployment.DedicatedType,
 			expectedPath:    "/dataplane/workspaces/1001/regulations/workerJobs/1",
@@ -156,9 +157,9 @@ func TestUpdateStatus(t *testing.T) {
 		{
 			name:            "DEDICATED MODE: update status request: returns error",
 			workspaceID:     "1001",
-			status:          model.JobStatusComplete,
+			status:          model.JobStatus{Status: model.JobStatusComplete},
 			jobID:           1,
-			expectedReqBody: `{"status":"complete"}`,
+			expectedReqBody: `{"status":"complete","reason":""}`,
 			respCode:        429,
 			expectedErr:     fmt.Errorf("update status failed with status code: 429"),
 			mode:            deployment.DedicatedType,
@@ -167,9 +168,9 @@ func TestUpdateStatus(t *testing.T) {
 		{
 			name:            "MULTITENANT MODE: update status request: successful",
 			workspaceID:     "1001",
-			status:          model.JobStatusComplete,
+			status:          model.JobStatus{Status: model.JobStatusComplete},
 			jobID:           1,
-			expectedReqBody: `{"status":"complete"}`,
+			expectedReqBody: `{"status":"complete","reason":""}`,
 			respCode:        201,
 			mode:            deployment.MultiTenantType,
 			expectedPath:    "/dataplane/namespaces/1001/regulations/workerJobs/1",
@@ -177,9 +178,20 @@ func TestUpdateStatus(t *testing.T) {
 		{
 			name:            "MULTITENANT MODE: update status request: returns error",
 			workspaceID:     "1001",
-			status:          model.JobStatusComplete,
+			status:          model.JobStatus{Status: model.JobStatusComplete},
 			jobID:           1,
-			expectedReqBody: `{"status":"complete"}`,
+			expectedReqBody: `{"status":"complete","reason":""}`,
+			respCode:        429,
+			expectedErr:     fmt.Errorf("update status failed with status code: 429"),
+			mode:            deployment.MultiTenantType,
+			expectedPath:    "/dataplane/namespaces/1001/regulations/workerJobs/1",
+		},
+		{
+			name:            "MULTITENANT MODE: update status request: returns error",
+			workspaceID:     "1001",
+			status:          model.JobStatus{Status: model.JobStatusFailed, Error: fmt.Errorf("some reason")},
+			jobID:           1,
+			expectedReqBody: `{"status":"failed","reason":"some reason"}`,
 			respCode:        429,
 			expectedErr:     fmt.Errorf("update status failed with status code: 429"),
 			mode:            deployment.MultiTenantType,

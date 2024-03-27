@@ -3,7 +3,6 @@ package processor
 import (
 	"context"
 	"database/sql"
-	"encoding/json"
 	"flag"
 	"fmt"
 	"log"
@@ -19,21 +18,22 @@ import (
 	"github.com/ory/dockertest/v3"
 	"github.com/stretchr/testify/require"
 
+	"github.com/rudderlabs/rudder-go-kit/config"
+	"github.com/rudderlabs/rudder-go-kit/logger"
+	"github.com/rudderlabs/rudder-server/admin"
+	backendconfig "github.com/rudderlabs/rudder-server/backend-config"
 	"github.com/rudderlabs/rudder-server/enterprise/reporting"
-	"github.com/rudderlabs/rudder-server/jobsdb/prebackup"
+	"github.com/rudderlabs/rudder-server/internal/enricher"
+	"github.com/rudderlabs/rudder-server/jobsdb"
+	mocksBackendConfig "github.com/rudderlabs/rudder-server/mocks/backend-config"
+	mocksTransformer "github.com/rudderlabs/rudder-server/mocks/processor/transformer"
+	destinationdebugger "github.com/rudderlabs/rudder-server/services/debugger/destination"
+	transformationdebugger "github.com/rudderlabs/rudder-server/services/debugger/transformation"
 	"github.com/rudderlabs/rudder-server/services/fileuploader"
 	"github.com/rudderlabs/rudder-server/services/rsources"
+	"github.com/rudderlabs/rudder-server/services/transformer"
 	"github.com/rudderlabs/rudder-server/services/transientsource"
-
-	"github.com/rudderlabs/rudder-server/admin"
-	"github.com/rudderlabs/rudder-server/config"
-	"github.com/rudderlabs/rudder-server/jobsdb"
-	mocksBackendConfig "github.com/rudderlabs/rudder-server/mocks/config/backend-config"
-	mocksTransformer "github.com/rudderlabs/rudder-server/mocks/processor/transformer"
-	"github.com/rudderlabs/rudder-server/processor/stash"
-	"github.com/rudderlabs/rudder-server/services/archiver"
-	"github.com/rudderlabs/rudder-server/services/multitenant"
-	"github.com/rudderlabs/rudder-server/utils/logger"
+	"github.com/rudderlabs/rudder-server/utils/pubsub"
 )
 
 var (
@@ -120,13 +120,7 @@ func blockOnHold() {
 func initJobsDB() {
 	config.Reset()
 	logger.Reset()
-	stash.Init()
 	admin.Init()
-	jobsdb.Init()
-	jobsdb.Init2()
-	jobsdb.Init3()
-	archiver.Init()
-	Init()
 }
 
 func genJobs(customVal string, jobCount, eventsPerJob int) []*jobsdb.JobT {
@@ -145,33 +139,26 @@ func genJobs(customVal string, jobCount, eventsPerJob int) []*jobsdb.JobT {
 }
 
 func TestProcessorManager(t *testing.T) {
-	temp := isUnLocked
-	defer func() { isUnLocked = temp }()
 	initJobsDB()
 	mockCtrl := gomock.NewController(t)
 	mockBackendConfig := mocksBackendConfig.NewMockBackendConfig(mockCtrl)
 	mockTransformer := mocksTransformer.NewMockTransformer(mockCtrl)
 	mockRsourcesService := rsources.NewMockJobService(mockCtrl)
 
-	SetFeaturesRetryAttempts(0)
-	enablePipelining = false
 	RegisterTestingT(t)
-	triggerAddNewDS := make(chan time.Time)
-	maxDSSize := 10
+	config.Reset()
+	c := config.New()
+	c.Set("JobsDB.maxDSSize", 10)
 	// tempDB is created to observe/manage the GW DB from the outside without touching the actual GW DB.
-	tempDB := jobsdb.HandleT{
-		MaxDSSize: &maxDSSize,
-		TriggerAddNewDS: func() <-chan time.Time {
-			return triggerAddNewDS
-		},
-	}
-
-	err := tempDB.Setup(jobsdb.Write, true, "gw", true, []prebackup.Handler{}, fileuploader.NewDefaultProvider())
-	require.NoError(t, err)
+	tempDB := jobsdb.NewForWrite(
+		"gw",
+		jobsdb.WithConfig(c),
+	)
+	require.NoError(t, tempDB.Start())
 	defer tempDB.TearDown()
 
 	customVal := "GW"
-	unprocessedListEmpty, err := tempDB.GetUnprocessed(context.Background(), jobsdb.GetQueryParamsT{
+	unprocessedListEmpty, err := tempDB.GetUnprocessed(context.Background(), jobsdb.GetQueryParams{
 		CustomValFilters: []string{customVal},
 		JobsLimit:        1,
 		ParameterFilters: []jobsdb.ParameterFilterT{},
@@ -184,24 +171,60 @@ func TestProcessorManager(t *testing.T) {
 	err = tempDB.Store(context.Background(), genJobs(customVal, jobCountPerDS, eventsPerJob))
 	require.NoError(t, err)
 
-	gwDB := jobsdb.NewForReadWrite("gw")
+	gwDB := jobsdb.NewForReadWrite("gw",
+		jobsdb.WithConfig(c),
+	)
 	defer gwDB.Close()
-	rtDB := jobsdb.NewForReadWrite("rt")
+	rtDB := jobsdb.NewForReadWrite("rt",
+		jobsdb.WithConfig(c),
+	)
 	defer rtDB.Close()
-	brtDB := jobsdb.NewForReadWrite("batch_rt")
+	brtDB := jobsdb.NewForReadWrite("batch_rt",
+		jobsdb.WithConfig(c),
+	)
 	defer brtDB.Close()
-	errDB := jobsdb.NewForReadWrite("proc_error")
-	defer errDB.Close()
+	readErrDB := jobsdb.NewForRead("proc_error",
+		jobsdb.WithConfig(c),
+	)
+	defer readErrDB.Close()
+	writeErrDB := jobsdb.NewForWrite("proc_error",
+		jobsdb.WithConfig(c),
+	)
+	require.NoError(t, writeErrDB.Start())
+	defer writeErrDB.TearDown()
+	eschDB := jobsdb.NewForReadWrite("esch",
+		jobsdb.WithConfig(c),
+	)
+	defer eschDB.Close()
+	archDB := jobsdb.NewForReadWrite("archival",
+		jobsdb.WithConfig(c),
+	)
+	defer archDB.Close()
 
 	clearDb := false
 	ctx := context.Background()
-	mtStat := &multitenant.Stats{
-		RouterDBs: map[string]jobsdb.MultiTenantJobsDB{
-			"rt":       &jobsdb.MultiTenantHandleT{HandleT: rtDB},
-			"batch_rt": &jobsdb.MultiTenantLegacy{HandleT: brtDB},
-		},
-	}
-	processor := New(ctx, &clearDb, gwDB, rtDB, brtDB, errDB, mtStat, &reporting.NOOP{}, transientsource.NewEmptyService(), fileuploader.NewDefaultProvider(), mockRsourcesService)
+
+	processor := New(
+		ctx,
+		&clearDb,
+		gwDB,
+		rtDB,
+		brtDB,
+		readErrDB,
+		writeErrDB,
+		eschDB,
+		archDB,
+		&reporting.NOOP{},
+		transientsource.NewEmptyService(),
+		fileuploader.NewDefaultProvider(),
+		mockRsourcesService,
+		transformer.NewNoOpService(),
+		destinationdebugger.NewNoOpService(),
+		transformationdebugger.NewNoOpService(),
+		[]enricher.PipelineEnricher{},
+		func(m *LifecycleManager) {
+			m.Handle.config.enablePipelining = false
+		})
 
 	t.Run("jobs are already there in GW DB before processor starts", func(t *testing.T) {
 		require.NoError(t, gwDB.Start())
@@ -210,20 +233,24 @@ func TestProcessorManager(t *testing.T) {
 		defer rtDB.Stop()
 		require.NoError(t, brtDB.Start())
 		defer brtDB.Stop()
-		require.NoError(t, errDB.Start())
-		defer errDB.Stop()
-		mockBackendConfig.EXPECT().Subscribe(gomock.Any(), gomock.Any()).Times(1)
+		require.NoError(t, readErrDB.Start())
+		defer readErrDB.Stop()
+		mockBackendConfig.EXPECT().Subscribe(gomock.Any(), gomock.Any()).Times(1).DoAndReturn(
+			func(ctx context.Context, topic backendconfig.Topic) pubsub.DataChannel {
+				ch := make(chan pubsub.DataEvent, 1)
+				ch <- pubsub.DataEvent{Data: map[string]backendconfig.ConfigT{sampleWorkspaceID: sampleBackendConfig}, Topic: string(topic)}
+				close(ch)
+				return ch
+			},
+		)
 		mockBackendConfig.EXPECT().WaitForConfig(gomock.Any()).Times(1)
-		mockTransformer.EXPECT().Setup().Times(1).Do(func() {
-			processor.HandleT.transformerFeatures = json.RawMessage(defaultTransformerFeatures)
-		})
 		mockRsourcesService.EXPECT().IncrementStats(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), rsources.Stats{Out: 10}).Times(1)
 		processor.BackendConfig = mockBackendConfig
-		processor.HandleT.transformer = mockTransformer
+		processor.Handle.transformer = mockTransformer
 		require.NoError(t, processor.Start())
 		defer processor.Stop()
 		Eventually(func() int {
-			res, err := tempDB.GetUnprocessed(context.Background(), jobsdb.GetQueryParamsT{
+			res, err := tempDB.GetUnprocessed(context.Background(), jobsdb.GetQueryParams{
 				CustomValFilters: []string{customVal},
 				JobsLimit:        20,
 				ParameterFilters: []jobsdb.ParameterFilterT{},
@@ -236,30 +263,39 @@ func TestProcessorManager(t *testing.T) {
 	t.Run("adding more jobs after the processor is already running", func(t *testing.T) {
 		require.NoError(t, gwDB.Start())
 		defer gwDB.Stop()
+		require.NoError(t, eschDB.Start())
+		defer eschDB.Stop()
+		require.NoError(t, archDB.Start())
+		defer archDB.Stop()
 		require.NoError(t, rtDB.Start())
 		defer rtDB.Stop()
 		require.NoError(t, brtDB.Start())
 		defer brtDB.Stop()
-		require.NoError(t, errDB.Start())
-		defer errDB.Stop()
-		mockBackendConfig.EXPECT().Subscribe(gomock.Any(), gomock.Any()).Times(1)
+		require.NoError(t, readErrDB.Start())
+		defer readErrDB.Stop()
+		mockBackendConfig.EXPECT().Subscribe(gomock.Any(), gomock.Any()).Times(1).DoAndReturn(
+			func(ctx context.Context, topic backendconfig.Topic) pubsub.DataChannel {
+				ch := make(chan pubsub.DataEvent, 1)
+				ch <- pubsub.DataEvent{Data: map[string]backendconfig.ConfigT{sampleWorkspaceID: sampleBackendConfig}, Topic: string(topic)}
+				close(ch)
+				return ch
+			},
+		)
+
 		mockBackendConfig.EXPECT().WaitForConfig(gomock.Any()).Times(1)
-		mockTransformer.EXPECT().Setup().Times(1).Do(func() {
-			processor.HandleT.transformerFeatures = json.RawMessage(defaultTransformerFeatures)
-		})
 		mockRsourcesService.EXPECT().IncrementStats(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), rsources.Stats{Out: 10}).Times(1)
 
 		require.NoError(t, processor.Start())
 		err = tempDB.Store(context.Background(), genJobs(customVal, jobCountPerDS, eventsPerJob))
 		require.NoError(t, err)
-		unprocessedListEmpty, err = tempDB.GetUnprocessed(context.Background(), jobsdb.GetQueryParamsT{
+		unprocessedListEmpty, err = tempDB.GetUnprocessed(context.Background(), jobsdb.GetQueryParams{
 			CustomValFilters: []string{customVal},
 			JobsLimit:        20,
 			ParameterFilters: []jobsdb.ParameterFilterT{},
 		})
 		require.NoError(t, err, "failed to get unprocessed jobs")
 		Eventually(func() int {
-			res, err := tempDB.GetUnprocessed(context.Background(), jobsdb.GetQueryParamsT{
+			res, err := tempDB.GetUnprocessed(context.Background(), jobsdb.GetQueryParams{
 				CustomValFilters: []string{customVal},
 				JobsLimit:        20,
 				ParameterFilters: []jobsdb.ParameterFilterT{},

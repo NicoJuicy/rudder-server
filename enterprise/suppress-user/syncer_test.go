@@ -4,9 +4,10 @@ import (
 	"net/http"
 	"testing"
 
-	"github.com/rudderlabs/rudder-server/services/controlplane/identity"
-	"github.com/rudderlabs/rudder-server/utils/logger"
 	"github.com/stretchr/testify/require"
+
+	"github.com/rudderlabs/rudder-go-kit/logger"
+	"github.com/rudderlabs/rudder-server/services/controlplane/identity"
 )
 
 func TestSyncer(t *testing.T) {

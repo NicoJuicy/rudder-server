@@ -4,6 +4,7 @@ package oauth
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -13,14 +14,15 @@ import (
 	"sync"
 	"time"
 
-	"github.com/rudderlabs/rudder-server/config"
-	backendconfig "github.com/rudderlabs/rudder-server/config/backend-config"
-	router_utils "github.com/rudderlabs/rudder-server/router/utils"
-	"github.com/rudderlabs/rudder-server/services/stats"
-	"github.com/rudderlabs/rudder-server/utils/httputil"
-	"github.com/rudderlabs/rudder-server/utils/logger"
-	"github.com/rudderlabs/rudder-server/utils/misc"
 	"github.com/tidwall/gjson"
+
+	"github.com/rudderlabs/rudder-go-kit/config"
+	"github.com/rudderlabs/rudder-go-kit/logger"
+	"github.com/rudderlabs/rudder-go-kit/stats"
+	backendconfig "github.com/rudderlabs/rudder-server/backend-config"
+	router_utils "github.com/rudderlabs/rudder-server/router/utils"
+	"github.com/rudderlabs/rudder-server/utils/httputil"
+	"github.com/rudderlabs/rudder-server/utils/misc"
 )
 
 type (
@@ -37,6 +39,8 @@ const (
 
 	DeleteAccountIdKey   = "rudderDeleteAccountId"
 	DeliveryAccountIdKey = "rudderAccountId"
+
+	AuthStatusInactive = "inactive"
 )
 
 type AccountSecret struct {
@@ -44,8 +48,9 @@ type AccountSecret struct {
 	Secret         json.RawMessage `json:"secret"`
 }
 type AuthResponse struct {
-	Account AccountSecret
-	Err     string
+	Account      AccountSecret
+	Err          string
+	ErrorMessage string
 }
 
 type OAuthStats struct {
@@ -59,6 +64,7 @@ type OAuthStats struct {
 	destDefName     string
 	isTokenFetch    bool // This stats field is used to identify if a request to get token is arising from processor
 	flowType        RudderFlow
+	action          string // refresh_token, fetch_token, auth_status_toggle
 }
 
 type DisableDestinationResponse struct {
@@ -66,32 +72,42 @@ type DisableDestinationResponse struct {
 	DestinationId string `json:"id"`
 }
 
-type RefreshTokenParams struct {
-	AccountId       string
+type AuthStatusToggleResponse struct {
+	Message string `json:"message,omitempty"`
+}
+
+type AuthStatusToggleParams struct {
+	Destination     *backendconfig.DestinationT
 	WorkspaceId     string
-	DestDefName     string
-	EventNamePrefix string
-	WorkerId        int
-	Secret          json.RawMessage
+	RudderAccountId string
+	AuthStatus      string
+}
+
+type RefreshTokenParams struct {
+	AccountId   string
+	WorkspaceId string
+	DestDefName string
+	WorkerId    int
+	Secret      json.RawMessage
 }
 
 // OAuthErrResHandler is the handle for this class
 type OAuthErrResHandler struct {
-	tr                   *http.Transport
-	client               *http.Client
-	logger               logger.Logger
-	destLockMap          map[string]*sync.RWMutex // This mutex map is used for disable destination locking
-	accountLockMap       map[string]*sync.RWMutex // This mutex map is used for refresh token locking
-	lockMapWMutex        *sync.RWMutex            // This mutex is used to prevent concurrent writes in lockMap(s) mentioned in the struct
-	destAuthInfoMap      map[string]*AuthResponse
-	refreshActiveMap     map[string]bool // Used to check if a refresh request for an account is already InProgress
-	disableDestActiveMap map[string]bool // Used to check if a disable destination request for a destination is already InProgress
-	tokenProvider        tokenProvider
-	rudderFlowType       RudderFlow
+	tr                        *http.Transport
+	client                    *http.Client
+	logger                    logger.Logger
+	destLockMap               map[string]*sync.RWMutex // This mutex map is used for disable destination locking
+	accountLockMap            map[string]*sync.RWMutex // This mutex map is used for refresh token locking
+	lockMapWMutex             *sync.RWMutex            // This mutex is used to prevent concurrent writes in lockMap(s) mentioned in the struct
+	destAuthInfoMap           map[string]*AuthResponse
+	refreshActiveMap          map[string]bool // Used to check if a refresh request for an account is already InProgress
+	authStatusUpdateActiveMap map[string]bool // Used to check if a authStatusInactive request for a destination is already InProgress
+	tokenProvider             tokenProvider
+	rudderFlowType            RudderFlow
 }
 
 type Authorizer interface {
-	DisableDestination(destination *backendconfig.DestinationT, workspaceId, rudderAccountId string) (statusCode int, resBody string)
+	AuthStatusToggle(*AuthStatusToggleParams) (int, string)
 	RefreshToken(refTokenParams *RefreshTokenParams) (int, *AuthResponse)
 	FetchToken(fetchTokenParams *RefreshTokenParams) (int, *AuthResponse)
 }
@@ -112,10 +128,15 @@ var (
 )
 
 const (
-	DISABLE_DEST                = "DISABLE_DESTINATION"
-	REFRESH_TOKEN               = "REFRESH_TOKEN"
-	INVALID_REFRESH_TOKEN_GRANT = "refresh_token_invalid_grant"
+	REFRESH_TOKEN = "REFRESH_TOKEN"
+	// Identifier to be sent from destination(during transformation/delivery)
+	AUTH_STATUS_INACTIVE = "AUTH_STATUS_INACTIVE"
+
+	// Identifier for invalid_grant or access_denied errors(during refreshing the token)
+	REF_TOKEN_INVALID_GRANT = "ref_token_invalid_grant"
 )
+
+var ErrPermissionOrTokenRevoked = errors.New("problem with user permission or access/refresh token have been revoked")
 
 // This struct only exists for marshalling and sending payload to control-plane
 type RefreshTokenBodyParams struct {
@@ -134,7 +155,7 @@ func Init() {
 }
 
 func GetAuthType(config map[string]interface{}) AuthType {
-	var lookupErr error
+	var lookupErr *misc.MapLookupError
 	var authValue interface{}
 	if authValue, lookupErr = misc.NestedMapLookup(config, "auth", "type"); lookupErr != nil {
 		return ""
@@ -154,13 +175,13 @@ func NewOAuthErrorHandler(provider tokenProvider, options ...func(*OAuthErrResHa
 		tr:            &http.Transport{},
 		client:        &http.Client{Timeout: config.GetDuration("HttpClient.oauth.timeout", 30, time.Second)},
 		// This timeout is kind of modifiable & it seemed like 10 mins for this is too much!
-		destLockMap:          make(map[string]*sync.RWMutex),
-		accountLockMap:       make(map[string]*sync.RWMutex),
-		lockMapWMutex:        &sync.RWMutex{},
-		destAuthInfoMap:      make(map[string]*AuthResponse),
-		refreshActiveMap:     make(map[string]bool),
-		disableDestActiveMap: make(map[string]bool),
-		rudderFlowType:       RudderFlow_Delivery,
+		destLockMap:               make(map[string]*sync.RWMutex),
+		accountLockMap:            make(map[string]*sync.RWMutex),
+		lockMapWMutex:             &sync.RWMutex{},
+		destAuthInfoMap:           make(map[string]*AuthResponse),
+		refreshActiveMap:          make(map[string]bool),
+		authStatusUpdateActiveMap: make(map[string]bool),
+		rudderFlowType:            RudderFlow_Delivery,
 	}
 	for _, opt := range options {
 		opt(oAuthErrResHandler)
@@ -200,8 +221,13 @@ func (authErrHandler *OAuthErrResHandler) RefreshToken(refTokenParams *RefreshTo
 		errorMessage:    "",
 		destDefName:     refTokenParams.DestDefName,
 		flowType:        authErrHandler.rudderFlowType,
+		action:          "refresh_token",
 	}
 	return authErrHandler.GetTokenInfo(refTokenParams, "Refresh token", authStats)
+}
+
+func getOAuthActionStatName(stat string) string {
+	return fmt.Sprintf("oauth_action_%v", stat)
 }
 
 func (authErrHandler *OAuthErrResHandler) FetchToken(fetchTokenParams *RefreshTokenParams) (int, *AuthResponse) {
@@ -216,6 +242,7 @@ func (authErrHandler *OAuthErrResHandler) FetchToken(fetchTokenParams *RefreshTo
 		destDefName:     fetchTokenParams.DestDefName,
 		isTokenFetch:    true,
 		flowType:        authErrHandler.rudderFlowType,
+		action:          "fetch_token",
 	}
 	return authErrHandler.GetTokenInfo(fetchTokenParams, "Fetch token", authStats)
 }
@@ -223,7 +250,7 @@ func (authErrHandler *OAuthErrResHandler) FetchToken(fetchTokenParams *RefreshTo
 func (authErrHandler *OAuthErrResHandler) GetTokenInfo(refTokenParams *RefreshTokenParams, logTypeName string, authStats *OAuthStats) (int, *AuthResponse) {
 	startTime := time.Now()
 	defer func() {
-		authStats.statName = fmt.Sprintf("%v_total_req_latency", refTokenParams.EventNamePrefix)
+		authStats.statName = getOAuthActionStatName("total_latency")
 		authStats.isCallToCpApi = false
 		authStats.SendTimerStats(startTime)
 	}()
@@ -279,13 +306,6 @@ func (authErrHandler *OAuthErrResHandler) GetTokenInfo(refTokenParams *RefreshTo
 
 	authErrHandler.logger.Debugf("[%s] [%v request] Lock Acquired by rt-worker-%d\n", loggerNm, logTypeName, refTokenParams.WorkerId)
 
-	errHandlerReqTimeStart := time.Now()
-	defer func() {
-		authStats.statName = fmt.Sprintf("%v_request_exec_time", refTokenParams.EventNamePrefix)
-		authStats.isCallToCpApi = true
-		authStats.SendTimerStats(errHandlerReqTimeStart)
-	}()
-
 	statusCode := authErrHandler.fetchAccountInfoFromCp(refTokenParams, refTokenBody, authStats, logTypeName)
 	return statusCode, authErrHandler.destAuthInfoMap[refTokenParams.AccountId]
 }
@@ -306,25 +326,25 @@ func (authErrHandler *OAuthErrResHandler) fetchAccountInfoFromCp(refTokenParams 
 		ContentType: "application/json; charset=utf-8",
 		Body:        string(res),
 		destName:    refTokenParams.DestDefName,
-		RequestType: logTypeName,
+		RequestType: authStats.action,
 	}
 	var accountSecret AccountSecret
 	// Stat for counting number of Refresh Token endpoint calls
-	authStats.statName = fmt.Sprintf(`%v_request_sent`, refTokenParams.EventNamePrefix)
+	authStats.statName = getOAuthActionStatName(`request_sent`)
 	authStats.isCallToCpApi = true
 	authStats.errorMessage = ""
 	authStats.SendCountStat()
 
 	cpiCallStartTime := time.Now()
 	statusCode, response := authErrHandler.cpApiCall(refreshCpReq)
-	authStats.statName = fmt.Sprintf(`%v_request_latency`, refTokenParams.EventNamePrefix)
+	authStats.statName = getOAuthActionStatName(`request_latency`)
 	authStats.SendTimerStats(cpiCallStartTime)
 
 	authErrHandler.logger.Debugf("[%s] Got the response from Control-Plane: rt-worker-%d with statusCode: %d\n", loggerNm, refTokenParams.WorkerId, statusCode)
 
 	// Empty Refresh token response
 	if !router_utils.IsNotEmptyString(response) {
-		authStats.statName = fmt.Sprintf("%s_failure", refTokenParams.EventNamePrefix)
+		authStats.statName = getOAuthActionStatName("failure")
 		authStats.errorMessage = "Empty secret"
 		authStats.SendCountStat()
 		// Setting empty accessToken value into in-memory auth info map(cache)
@@ -338,18 +358,20 @@ func (authErrHandler *OAuthErrResHandler) fetchAccountInfoFromCp(refTokenParams 
 		return http.StatusInternalServerError
 	}
 
-	if refErrMsg := getRefreshTokenErrResp(response, &accountSecret); router_utils.IsNotEmptyString(refErrMsg) {
+	if errType, refErrMsg := authErrHandler.getRefreshTokenErrResp(response, &accountSecret); router_utils.IsNotEmptyString(refErrMsg) {
 		if _, ok := authErrHandler.destAuthInfoMap[refTokenParams.AccountId]; !ok {
 			authErrHandler.destAuthInfoMap[refTokenParams.AccountId] = &AuthResponse{
-				Err: refErrMsg,
+				Err:          errType,
+				ErrorMessage: refErrMsg,
 			}
 		} else {
-			authErrHandler.destAuthInfoMap[refTokenParams.AccountId].Err = refErrMsg
+			authErrHandler.destAuthInfoMap[refTokenParams.AccountId].Err = errType
+			authErrHandler.destAuthInfoMap[refTokenParams.AccountId].ErrorMessage = refErrMsg
 		}
-		authStats.statName = fmt.Sprintf("%s_failure", refTokenParams.EventNamePrefix)
+		authStats.statName = getOAuthActionStatName("failure")
 		authStats.errorMessage = refErrMsg
 		authStats.SendCountStat()
-		if refErrMsg == INVALID_REFRESH_TOKEN_GRANT {
+		if refErrMsg == REF_TOKEN_INVALID_GRANT {
 			// Should abort the event as refresh is not going to work
 			// until we have new refresh token for the account
 			return http.StatusBadRequest
@@ -360,26 +382,35 @@ func (authErrHandler *OAuthErrResHandler) fetchAccountInfoFromCp(refTokenParams 
 	authErrHandler.destAuthInfoMap[refTokenParams.AccountId] = &AuthResponse{
 		Account: accountSecret,
 	}
-	authStats.statName = fmt.Sprintf("%s_success", refTokenParams.EventNamePrefix)
+	authStats.statName = getOAuthActionStatName("success")
 	authStats.errorMessage = ""
 	authStats.SendCountStat()
 	authErrHandler.logger.Debugf("[%s request] :: (Write) %s response received(rt-worker-%d): %s\n", loggerNm, logTypeName, refTokenParams.WorkerId, response)
 	return http.StatusOK
 }
 
-func getRefreshTokenErrResp(response string, accountSecret *AccountSecret) (message string) {
+func (authErrHandler *OAuthErrResHandler) getRefreshTokenErrResp(response string, accountSecret *AccountSecret) (errorType, message string) {
 	if err := json.Unmarshal([]byte(response), &accountSecret); err != nil {
 		// Some problem with AccountSecret unmarshalling
 		message = fmt.Sprintf("Unmarshal of response unsuccessful: %v", response)
-	} else if gjson.Get(response, "body.code").String() == INVALID_REFRESH_TOKEN_GRANT {
+		errorType = "unmarshallableResponse"
+	} else if gjson.Get(response, "body.code").String() == REF_TOKEN_INVALID_GRANT {
 		// User (or) AccessToken (or) RefreshToken has been revoked
-		message = INVALID_REFRESH_TOKEN_GRANT
+		bodyMsg := gjson.Get(response, "body.message").String()
+		if bodyMsg == "" {
+			// Default message
+			authErrHandler.logger.Debugf("Failed with error response: %v\n", response)
+			message = ErrPermissionOrTokenRevoked.Error()
+		} else {
+			message = bodyMsg
+		}
+		errorType = REF_TOKEN_INVALID_GRANT
 	}
-	return message
+	return errorType, message
 }
 
 func (authStats *OAuthStats) SendTimerStats(startTime time.Time) {
-	stats.Default.NewTaggedStat(authStats.statName, stats.TimerType, stats.Tags{
+	statsTags := stats.Tags{
 		"id":              authStats.id,
 		"workspaceId":     authStats.workspaceId,
 		"rudderCategory":  authStats.rudderCategory,
@@ -387,12 +418,14 @@ func (authStats *OAuthStats) SendTimerStats(startTime time.Time) {
 		"authErrCategory": authStats.authErrCategory,
 		"destType":        authStats.destDefName,
 		"flowType":        string(authStats.flowType),
-	}).SendTiming(time.Since(startTime))
+		"action":          authStats.action,
+	}
+	stats.Default.NewTaggedStat(authStats.statName, stats.TimerType, statsTags).SendTiming(time.Since(startTime))
 }
 
 // Send count type stats related to OAuth(Destination)
 func (refStats *OAuthStats) SendCountStat() {
-	stats.Default.NewTaggedStat(refStats.statName, stats.CountType, stats.Tags{
+	statsTags := stats.Tags{
 		"id":              refStats.id,
 		"workspaceId":     refStats.workspaceId,
 		"rudderCategory":  refStats.rudderCategory,
@@ -402,95 +435,102 @@ func (refStats *OAuthStats) SendCountStat() {
 		"destType":        refStats.destDefName,
 		"isTokenFetch":    strconv.FormatBool(refStats.isTokenFetch),
 		"flowType":        string(refStats.flowType),
-	}).Increment()
+		"action":          refStats.action,
+	}
+	stats.Default.NewTaggedStat(refStats.statName, stats.CountType, statsTags).Increment()
 }
 
-func (authErrHandler *OAuthErrResHandler) DisableDestination(destination *backendconfig.DestinationT, workspaceId, rudderAccountId string) (statusCode int, respBody string) {
+func (authErrHandler *OAuthErrResHandler) AuthStatusToggle(params *AuthStatusToggleParams) (statusCode int, respBody string) {
 	authErrHandlerTimeStart := time.Now()
-	destinationId := destination.ID
-	disableDestMutex := authErrHandler.getKeyMutex(authErrHandler.destLockMap, destinationId)
+	destinationId := params.Destination.ID
+	authStatusToggleMutex := authErrHandler.getKeyMutex(authErrHandler.destLockMap, destinationId)
+	action := fmt.Sprintf("auth_status_%v", params.AuthStatus)
 
-	disableDestStats := &OAuthStats{
+	authStatusToggleStats := &OAuthStats{
 		id:              destinationId,
-		workspaceId:     workspaceId,
+		workspaceId:     params.WorkspaceId,
 		rudderCategory:  "destination",
 		statName:        "",
 		isCallToCpApi:   false,
-		authErrCategory: DISABLE_DEST,
+		authErrCategory: AUTH_STATUS_INACTIVE,
 		errorMessage:    "",
-		destDefName:     destination.DestinationDefinition.Name,
+		destDefName:     params.Destination.DestinationDefinition.Name,
 		flowType:        authErrHandler.rudderFlowType,
+		action:          action,
 	}
 	defer func() {
-		disableDestStats.statName = "disable_destination_total_req_latency"
-		disableDestStats.isCallToCpApi = false
-		disableDestStats.SendTimerStats(authErrHandlerTimeStart)
+		authStatusToggleStats.statName = getOAuthActionStatName("total_latency")
+		authStatusToggleStats.isCallToCpApi = false
+		authStatusToggleStats.SendTimerStats(authErrHandlerTimeStart)
 	}()
 
-	disableDestMutex.Lock()
-	isDisableDestActive, isDisableDestReqPresent := authErrHandler.disableDestActiveMap[destinationId]
-	disableActiveReq := strconv.FormatBool(isDisableDestReqPresent && isDisableDestActive)
-	if isDisableDestReqPresent && isDisableDestActive {
-		disableDestMutex.Unlock()
-		authErrHandler.logger.Debugf("[%s request] :: Disable Destination Active : %s\n", loggerNm, disableActiveReq)
-		return http.StatusOK, fmt.Sprintf(`{response: {isDisabled: %v, activeRequest: %v}`, false, disableActiveReq)
+	authStatusToggleMutex.Lock()
+	isAuthStatusUpdateActive, isAuthStatusUpdateReqPresent := authErrHandler.authStatusUpdateActiveMap[destinationId]
+	authStatusUpdateActiveReq := strconv.FormatBool(isAuthStatusUpdateReqPresent && isAuthStatusUpdateActive)
+	if isAuthStatusUpdateReqPresent && isAuthStatusUpdateActive {
+		authStatusToggleMutex.Unlock()
+		authErrHandler.logger.Debugf("[%s request] :: AuthStatusInactive request Active : %s\n", loggerNm, authStatusUpdateActiveReq)
+		return http.StatusConflict, ErrPermissionOrTokenRevoked.Error()
 	}
 
-	authErrHandler.disableDestActiveMap[destinationId] = true
-	disableDestMutex.Unlock()
+	authErrHandler.authStatusUpdateActiveMap[destinationId] = true
+	authStatusToggleMutex.Unlock()
 
 	defer func() {
-		disableDestMutex.Lock()
-		authErrHandler.disableDestActiveMap[destinationId] = false
-		authErrHandler.logger.Debugf("[%s request] :: Disable request is inactive!", loggerNm)
-		disableDestMutex.Unlock()
+		authStatusToggleMutex.Lock()
+		authErrHandler.authStatusUpdateActiveMap[destinationId] = false
+		authErrHandler.logger.Debugf("[%s request] :: AuthStatusInactive request is inactive!", loggerNm)
+		authStatusToggleMutex.Unlock()
+		// After trying to inactivate authStatus for destination, need to remove existing accessToken(from in-memory cache)
+		// This is being done to obtain new token after an update such as re-authorisation is done
+		accountMutex := authErrHandler.getKeyMutex(authErrHandler.accountLockMap, params.RudderAccountId)
+		accountMutex.Lock()
+		delete(authErrHandler.destAuthInfoMap, params.RudderAccountId)
+		accountMutex.Unlock()
 	}()
 
-	disableURL := fmt.Sprintf("%s/workspaces/%s/destinations/%s/disable", configBEURL, workspaceId, destinationId)
-	disableCpReq := &ControlPlaneRequestT{
-		Url:         disableURL,
-		Method:      http.MethodDelete,
-		destName:    destination.DestinationDefinition.Name,
-		RequestType: "Disable destination",
+	authStatusToggleUrl := fmt.Sprintf("%s/workspaces/%s/destinations/%s/authStatus/toggle", configBEURL, params.WorkspaceId, destinationId)
+
+	authStatusInactiveCpReq := &ControlPlaneRequestT{
+		Url:         authStatusToggleUrl,
+		Method:      http.MethodPut,
+		Body:        fmt.Sprintf(`{"authStatus": "%v"}`, params.AuthStatus),
+		ContentType: "application/json",
+		destName:    params.Destination.DestinationDefinition.Name,
+		RequestType: action,
 	}
 
-	disableDestStats.statName = "disable_destination_request_sent"
-	disableDestStats.isCallToCpApi = true
-	disableDestStats.SendCountStat()
+	authStatusToggleStats.statName = getOAuthActionStatName("request_sent")
+	authStatusToggleStats.isCallToCpApi = true
+	authStatusToggleStats.SendCountStat()
 
 	cpiCallStartTime := time.Now()
-	statusCode, respBody = authErrHandler.cpApiCall(disableCpReq)
-	disableDestStats.statName = `disable_destination_request_latency`
-	defer disableDestStats.SendTimerStats(cpiCallStartTime)
-	authErrHandler.logger.Debugf(`Response from CP(stCd: %v) for disable dest req: %v`, statusCode, respBody)
+	statusCode, respBody = authErrHandler.cpApiCall(authStatusInactiveCpReq)
+	authStatusToggleStats.statName = getOAuthActionStatName("request_latency")
+	defer authStatusToggleStats.SendTimerStats(cpiCallStartTime)
+	authErrHandler.logger.Errorf(`Response from CP(stCd: %v) for auth status inactive req: %v`, statusCode, respBody)
 
-	var disableDestRes *DisableDestinationResponse
-	if disableErr := json.Unmarshal([]byte(respBody), &disableDestRes); disableErr != nil || !router_utils.IsNotEmptyString(disableDestRes.DestinationId) {
+	var authStatusToggleRes *AuthStatusToggleResponse
+	unmarshalErr := json.Unmarshal([]byte(respBody), &authStatusToggleRes)
+	if router_utils.IsNotEmptyString(respBody) && (unmarshalErr != nil || !router_utils.IsNotEmptyString(authStatusToggleRes.Message) || statusCode != http.StatusOK) {
 		var msg string
-		if disableErr != nil {
-			msg = disableErr.Error()
+		if unmarshalErr != nil {
+			msg = unmarshalErr.Error()
 		} else {
-			msg = "Could not disable the destination"
+			msg = fmt.Sprintf("Could not update authStatus to inactive for destination: %v", authStatusToggleRes.Message)
 		}
-		disableDestStats.statName = "disable_destination_failure"
-		disableDestStats.errorMessage = msg
-		disableDestStats.SendCountStat()
-		return http.StatusBadRequest, msg
+		authStatusToggleStats.statName = getOAuthActionStatName("failure")
+		authStatusToggleStats.errorMessage = msg
+		authStatusToggleStats.SendCountStat()
+		return http.StatusBadRequest, ErrPermissionOrTokenRevoked.Error()
 	}
 
-	authErrHandler.logger.Debugf("[%s request] :: (Write) Disable Response received : %s\n", loggerNm, respBody)
-	disableDestStats.statName = "disable_destination_success"
-	disableDestStats.errorMessage = ""
-	disableDestStats.SendCountStat()
+	authErrHandler.logger.Errorf("[%s request] :: (Write) auth status inactive Response received : %s\n", loggerNm, respBody)
+	authStatusToggleStats.statName = getOAuthActionStatName("success")
+	authStatusToggleStats.errorMessage = ""
+	authStatusToggleStats.SendCountStat()
 
-	// After a successfully disabling the destination, need to remove existing accessToken(from in-memory cache)
-	// This is being done to obtain new token after re-enabling disabled destination
-	accountMutex := authErrHandler.getKeyMutex(authErrHandler.accountLockMap, rudderAccountId)
-	accountMutex.Lock()
-	defer accountMutex.Unlock()
-	delete(authErrHandler.destAuthInfoMap, rudderAccountId)
-
-	return statusCode, fmt.Sprintf(`{response: {isDisabled: %v, activeRequest: %v}`, !disableDestRes.Enabled, false)
+	return http.StatusBadRequest, ErrPermissionOrTokenRevoked.Error()
 }
 
 func processResponse(resp *http.Response) (statusCode int, respBody string) {

@@ -17,27 +17,30 @@ import (
 	"github.com/ory/dockertest/v3"
 	"github.com/stretchr/testify/require"
 
-	"github.com/rudderlabs/rudder-server/enterprise/reporting"
-	"github.com/rudderlabs/rudder-server/services/fileuploader"
-	"github.com/rudderlabs/rudder-server/services/rsources"
-	"github.com/rudderlabs/rudder-server/services/transientsource"
-
+	"github.com/rudderlabs/rudder-go-kit/config"
+	"github.com/rudderlabs/rudder-go-kit/logger"
+	"github.com/rudderlabs/rudder-go-kit/stats"
 	"github.com/rudderlabs/rudder-server/admin"
 	"github.com/rudderlabs/rudder-server/app/cluster"
-	"github.com/rudderlabs/rudder-server/config"
-	backendConfig "github.com/rudderlabs/rudder-server/config/backend-config"
+	arc "github.com/rudderlabs/rudder-server/archiver"
+	backendConfig "github.com/rudderlabs/rudder-server/backend-config"
+	"github.com/rudderlabs/rudder-server/enterprise/reporting"
+	"github.com/rudderlabs/rudder-server/internal/enricher"
 	"github.com/rudderlabs/rudder-server/jobsdb"
-	mocksBackendConfig "github.com/rudderlabs/rudder-server/mocks/config/backend-config"
+	mocksBackendConfig "github.com/rudderlabs/rudder-server/mocks/backend-config"
+	mock_jobs_forwarder "github.com/rudderlabs/rudder-server/mocks/jobs-forwarder"
 	mocksTransformer "github.com/rudderlabs/rudder-server/mocks/processor/transformer"
-	mock_tenantstats "github.com/rudderlabs/rudder-server/mocks/services/multitenant"
 	"github.com/rudderlabs/rudder-server/processor"
-	"github.com/rudderlabs/rudder-server/processor/stash"
 	"github.com/rudderlabs/rudder-server/router"
 	"github.com/rudderlabs/rudder-server/router/batchrouter"
 	routermanager "github.com/rudderlabs/rudder-server/router/manager"
-	"github.com/rudderlabs/rudder-server/services/archiver"
-	"github.com/rudderlabs/rudder-server/services/multitenant"
-	"github.com/rudderlabs/rudder-server/utils/logger"
+	"github.com/rudderlabs/rudder-server/router/throttler"
+	destinationdebugger "github.com/rudderlabs/rudder-server/services/debugger/destination"
+	transformationdebugger "github.com/rudderlabs/rudder-server/services/debugger/transformation"
+	"github.com/rudderlabs/rudder-server/services/fileuploader"
+	"github.com/rudderlabs/rudder-server/services/rsources"
+	"github.com/rudderlabs/rudder-server/services/transformer"
+	"github.com/rudderlabs/rudder-server/services/transientsource"
 	"github.com/rudderlabs/rudder-server/utils/pubsub"
 	"github.com/rudderlabs/rudder-server/utils/types/servermode"
 )
@@ -157,73 +160,85 @@ var (
 func initJobsDB() {
 	config.Reset()
 	logger.Reset()
-	stash.Init()
 	admin.Init()
-	jobsdb.Init()
-	jobsdb.Init2()
-	jobsdb.Init3()
-	archiver.Init()
-	router.Init()
-	router.InitRouterAdmin()
-	batchrouter.Init()
-	batchrouter.Init2()
-	processor.Init()
 	Init()
 }
 
 func TestDynamicClusterManager(t *testing.T) {
 	initJobsDB()
 
-	processor.SetFeaturesRetryAttempts(0)
-
 	mockCtrl := gomock.NewController(t)
-	mockMTI := mock_tenantstats.NewMockMultiTenantI(mockCtrl)
 	mockBackendConfig := mocksBackendConfig.NewMockBackendConfig(mockCtrl)
 	mockTransformer := mocksTransformer.NewMockTransformer(mockCtrl)
 	mockRsourcesService := rsources.NewMockJobService(mockCtrl)
 
 	gwDB := jobsdb.NewForReadWrite("gw")
 	defer gwDB.TearDown()
+	eschDB := jobsdb.NewForReadWrite("esch")
+	defer eschDB.TearDown()
+	archiveDB := jobsdb.NewForReadWrite("archive")
+	defer archiveDB.TearDown()
 	rtDB := jobsdb.NewForReadWrite("rt")
 	defer rtDB.TearDown()
 	brtDB := jobsdb.NewForReadWrite("batch_rt")
 	defer brtDB.TearDown()
-	errDB := jobsdb.NewForReadWrite("proc_error")
-	defer errDB.TearDown()
+
+	archDB := jobsdb.NewForReadWrite("archival")
+	defer archDB.TearDown()
+	readErrDB := jobsdb.NewForRead("proc_error")
+	defer readErrDB.TearDown()
+	writeErrDB := jobsdb.NewForWrite("proc_error")
+	require.NoError(t, writeErrDB.Start())
+	defer writeErrDB.TearDown()
 
 	clearDb := false
 	ctx := context.Background()
-	mtStat := multitenant.NewStats(map[string]jobsdb.MultiTenantJobsDB{
-		"rt":       &jobsdb.MultiTenantHandleT{HandleT: rtDB},
-		"batch_rt": &jobsdb.MultiTenantLegacy{HandleT: brtDB},
-	})
 
-	processor := processor.New(ctx, &clearDb, gwDB, rtDB, brtDB, errDB, mockMTI, &reporting.NOOP{}, transientsource.NewEmptyService(), fileuploader.NewDefaultProvider(), rsources.NewNoOpService())
+	schemaForwarder := mock_jobs_forwarder.NewMockForwarder(gomock.NewController(t))
+
+	processor := processor.New(
+		ctx,
+		&clearDb,
+		gwDB,
+		rtDB,
+		brtDB,
+		readErrDB,
+		writeErrDB,
+		eschDB,
+		archDB,
+		&reporting.NOOP{},
+		transientsource.NewEmptyService(),
+		fileuploader.NewDefaultProvider(),
+		rsources.NewNoOpService(),
+		transformer.NewNoOpService(),
+		destinationdebugger.NewNoOpService(),
+		transformationdebugger.NewNoOpService(),
+		[]enricher.PipelineEnricher{},
+	)
 	processor.BackendConfig = mockBackendConfig
 	processor.Transformer = mockTransformer
 	mockBackendConfig.EXPECT().WaitForConfig(gomock.Any()).Times(1)
-	mockTransformer.EXPECT().Setup().Times(1)
 
-	tDb := &jobsdb.MultiTenantHandleT{HandleT: rtDB}
 	rtFactory := &router.Factory{
-		Reporting:        &reporting.NOOP{},
-		Multitenant:      mockMTI,
-		BackendConfig:    mockBackendConfig,
-		RouterDB:         tDb,
-		ProcErrorDB:      errDB,
-		TransientSources: transientsource.NewEmptyService(),
-		RsourcesService:  mockRsourcesService,
+		Logger:                     logger.NOP,
+		Reporting:                  &reporting.NOOP{},
+		BackendConfig:              mockBackendConfig,
+		RouterDB:                   rtDB,
+		ProcErrorDB:                readErrDB,
+		TransientSources:           transientsource.NewEmptyService(),
+		RsourcesService:            mockRsourcesService,
+		TransformerFeaturesService: transformer.NewNoOpService(),
+		ThrottlerFactory:           throttler.NewNoOpThrottlerFactory(),
 	}
 	brtFactory := &batchrouter.Factory{
 		Reporting:        &reporting.NOOP{},
-		Multitenant:      mockMTI,
 		BackendConfig:    mockBackendConfig,
 		RouterDB:         brtDB,
-		ProcErrorDB:      errDB,
+		ProcErrorDB:      readErrDB,
 		TransientSources: transientsource.NewEmptyService(),
 		RsourcesService:  mockRsourcesService,
 	}
-	router := routermanager.New(rtFactory, brtFactory, mockBackendConfig)
+	router := routermanager.New(rtFactory, brtFactory, mockBackendConfig, logger.NewLogger())
 
 	mockBackendConfig.EXPECT().Subscribe(gomock.Any(), gomock.Any()).DoAndReturn(func(
 		ctx context.Context, topic backendConfig.Topic,
@@ -238,20 +253,28 @@ func TestDynamicClusterManager(t *testing.T) {
 
 		return ch
 	}).AnyTimes()
-	mockMTI.EXPECT().UpdateWorkspaceLatencyMap(gomock.Any(), gomock.Any(), gomock.Any()).AnyTimes()
-	mockMTI.EXPECT().GetRouterPickupJobs(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).AnyTimes()
+	schemaForwarder.EXPECT().Start().Return(nil).AnyTimes()
+	schemaForwarder.EXPECT().Stop().AnyTimes()
 
 	provider := &mockModeProvider{modeCh: make(chan servermode.ChangeEvent)}
 	dCM := &cluster.Dynamic{
-		GatewayDB:     gwDB,
-		RouterDB:      rtDB,
-		BatchRouterDB: brtDB,
-		ErrorDB:       errDB,
+		GatewayDB:       gwDB,
+		RouterDB:        rtDB,
+		BatchRouterDB:   brtDB,
+		ErrorDB:         readErrDB,
+		EventSchemaDB:   eschDB,
+		ArchivalDB:      archDB,
+		SchemaForwarder: schemaForwarder,
+		Archiver: arc.New(
+			archiveDB,
+			nil,
+			config.Default,
+			stats.Default,
+		),
 
-		Processor:       processor,
-		Router:          router,
-		Provider:        provider,
-		MultiTenantStat: mtStat,
+		Processor: processor,
+		Router:    router,
+		Provider:  provider,
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())

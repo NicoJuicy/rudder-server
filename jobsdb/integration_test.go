@@ -12,16 +12,18 @@ import (
 	"github.com/stretchr/testify/require"
 	"golang.org/x/sync/errgroup"
 
+	"github.com/rudderlabs/rudder-go-kit/config"
+	"github.com/rudderlabs/rudder-go-kit/testhelper/rand"
 	"github.com/rudderlabs/rudder-server/jobsdb/prebackup"
 	fileuploader "github.com/rudderlabs/rudder-server/services/fileuploader"
-	"github.com/rudderlabs/rudder-server/testhelper/rand"
+	. "github.com/rudderlabs/rudder-server/utils/tx" //nolint:staticcheck
 )
 
 const (
 	defaultWorkspaceID = "workspaceId"
 )
 
-func genJobs(workspaceId, customVal string, jobCount, eventsPerJob int) []*JobT {
+func genJobs(workspaceId, customVal string, jobCount, eventsPerJob int) []*JobT { // nolint: unparam
 	js := make([]*JobT, jobCount)
 	for i := range js {
 		js[i] = &JobT{
@@ -61,14 +63,16 @@ func TestJobsDB(t *testing.T) {
 	_ = startPostgres(t)
 
 	triggerAddNewDS := make(chan time.Time)
-	maxDSSize := 10
-	jobDB := HandleT{
-		MaxDSSize: &maxDSSize,
+	config.Reset()
+	c := config.New()
+	c.Set("jobsdb.maxDSSize", 10)
+	jobDB := Handle{
 		TriggerAddNewDS: func() <-chan time.Time {
 			return triggerAddNewDS
 		},
+		config: c,
 	}
-	err := jobDB.Setup(ReadWrite, false, strings.ToLower(rand.String(5)), true, []prebackup.Handler{}, fileuploader.NewDefaultProvider())
+	err := jobDB.Setup(ReadWrite, false, strings.ToLower(rand.String(5)), []prebackup.Handler{}, fileuploader.NewDefaultProvider())
 	require.NoError(t, err)
 	defer jobDB.TearDown()
 
@@ -81,7 +85,7 @@ func TestJobsDB(t *testing.T) {
 		CustomVal:    customVal,
 	}
 
-	unprocessedJobEmpty, err := jobDB.GetUnprocessed(context.Background(), GetQueryParamsT{
+	unprocessedJobEmpty, err := jobDB.GetUnprocessed(context.Background(), GetQueryParams{
 		CustomValFilters: []string{customVal},
 		JobsLimit:        1,
 		ParameterFilters: []ParameterFilterT{},
@@ -92,7 +96,7 @@ func TestJobsDB(t *testing.T) {
 	err = jobDB.Store(context.Background(), []*JobT{&sampleTestJob})
 	require.NoError(t, err)
 
-	unprocessedJob, err := jobDB.GetUnprocessed(context.Background(), GetQueryParamsT{
+	unprocessedJob, err := jobDB.GetUnprocessed(context.Background(), GetQueryParams{
 		CustomValFilters: []string{customVal},
 		JobsLimit:        1,
 		ParameterFilters: []ParameterFilterT{},
@@ -116,7 +120,7 @@ func TestJobsDB(t *testing.T) {
 	err = jobDB.UpdateJobStatus(context.Background(), []*JobStatusT{&status}, []string{customVal}, []ParameterFilterT{})
 	require.NoError(t, err)
 
-	uj, err := jobDB.GetUnprocessed(context.Background(), GetQueryParamsT{
+	uj, err := jobDB.GetUnprocessed(context.Background(), GetQueryParams{
 		CustomValFilters: []string{customVal},
 		JobsLimit:        1,
 		ParameterFilters: []ParameterFilterT{},
@@ -140,7 +144,7 @@ func TestJobsDB(t *testing.T) {
 		}
 
 		t.Log("GetUnprocessed with job count limit")
-		JobLimitJob, err := jobDB.GetUnprocessed(context.Background(), GetQueryParamsT{
+		JobLimitJob, err := jobDB.GetUnprocessed(context.Background(), GetQueryParams{
 			CustomValFilters: []string{customVal},
 			JobsLimit:        100,
 			ParameterFilters: []ParameterFilterT{},
@@ -150,7 +154,7 @@ func TestJobsDB(t *testing.T) {
 		require.Equal(t, jobCount, len(JobLimitList))
 
 		t.Log("GetUnprocessed with event count limit")
-		eventLimitJob, err := jobDB.GetUnprocessed(context.Background(), GetQueryParamsT{
+		eventLimitJob, err := jobDB.GetUnprocessed(context.Background(), GetQueryParams{
 			CustomValFilters: []string{customVal},
 			JobsLimit:        100,
 			EventsLimit:      eventsPerJob * 20,
@@ -165,7 +169,7 @@ func TestJobsDB(t *testing.T) {
 		}
 
 		t.Log("Repeat read")
-		eventLimitListRepeat, err := jobDB.GetUnprocessed(context.Background(), GetQueryParamsT{
+		eventLimitListRepeat, err := jobDB.GetUnprocessed(context.Background(), GetQueryParams{
 			CustomValFilters: []string{customVal},
 			JobsLimit:        100,
 			EventsLimit:      eventsPerJob * 20,
@@ -195,7 +199,7 @@ func TestJobsDB(t *testing.T) {
 		require.NoError(t, err)
 
 		t.Log("GetUnprocessed with job count limit")
-		retryJobLimitList, err := jobDB.GetToRetry(context.Background(), GetQueryParamsT{
+		retryJobLimitList, err := jobDB.GetFailed(context.Background(), GetQueryParams{
 			CustomValFilters: []string{customVal},
 			JobsLimit:        100,
 		})
@@ -203,7 +207,7 @@ func TestJobsDB(t *testing.T) {
 		require.Equal(t, jobCount, len(retryJobLimitList.Jobs))
 
 		t.Log("GetToRetry with event count limit")
-		retryEventLimitList, err := jobDB.GetToRetry(context.Background(), GetQueryParamsT{
+		retryEventLimitList, err := jobDB.GetFailed(context.Background(), GetQueryParams{
 			CustomValFilters: []string{customVal},
 			JobsLimit:        100,
 			EventsLimit:      eventsPerJob * 20,
@@ -221,15 +225,15 @@ func TestJobsDB(t *testing.T) {
 
 		triggerAddNewDS := make(chan time.Time)
 
-		maxDSSize := 9
-		jobDB := HandleT{
-			MaxDSSize: &maxDSSize,
+		c.Set("jobsdb.maxDSSize", 9)
+		jobDB := Handle{
 			TriggerAddNewDS: func() <-chan time.Time {
 				return triggerAddNewDS
 			},
+			config: c,
 		}
 
-		err := jobDB.Setup(ReadWrite, true, strings.ToLower(rand.String(5)), true, []prebackup.Handler{}, fileuploader.NewDefaultProvider())
+		err := jobDB.Setup(ReadWrite, true, strings.ToLower(rand.String(5)), []prebackup.Handler{}, fileuploader.NewDefaultProvider())
 		require.NoError(t, err)
 		defer jobDB.TearDown()
 
@@ -250,7 +254,7 @@ func TestJobsDB(t *testing.T) {
 		t.Log("Using event count that will cause spill-over, not exact for ds1, but remainder suitable for ds2")
 		trickyEventCount := (eventsPerJobDS1 * (jobCountPerDS - 1)) + eventsPerJobDS2
 
-		eventLimitList, err := jobDB.GetUnprocessed(context.Background(), GetQueryParamsT{
+		eventLimitList, err := jobDB.GetUnprocessed(context.Background(), GetQueryParams{
 			CustomValFilters: []string{customVal},
 			JobsLimit:        100,
 			EventsLimit:      trickyEventCount,
@@ -262,7 +266,7 @@ func TestJobsDB(t *testing.T) {
 
 		t.Log("Prepare GetToRetry")
 		{
-			allJobs, err := jobDB.GetUnprocessed(context.Background(), GetQueryParamsT{
+			allJobs, err := jobDB.GetUnprocessed(context.Background(), GetQueryParams{
 				CustomValFilters: []string{customVal},
 				JobsLimit:        1000,
 				ParameterFilters: []ParameterFilterT{},
@@ -290,7 +294,7 @@ func TestJobsDB(t *testing.T) {
 
 		t.Log("Test spill over with GetToRetry")
 		{
-			eventLimitList, err := jobDB.GetToRetry(context.Background(), GetQueryParamsT{
+			eventLimitList, err := jobDB.GetFailed(context.Background(), GetQueryParams{
 				CustomValFilters: []string{customVal},
 				JobsLimit:        100,
 				EventsLimit:      trickyEventCount,
@@ -307,15 +311,15 @@ func TestJobsDB(t *testing.T) {
 
 		triggerAddNewDS := make(chan time.Time)
 
-		maxDSSize := 2
-		jobDB := HandleT{
-			MaxDSSize: &maxDSSize,
+		c.Set("jobsdb.maxDSSize", 2)
+		jobDB := Handle{
 			TriggerAddNewDS: func() <-chan time.Time {
 				return triggerAddNewDS
 			},
+			config: c,
 		}
 
-		err := jobDB.Setup(ReadWrite, true, strings.ToLower(rand.String(5)), true, []prebackup.Handler{}, fileuploader.NewDefaultProvider())
+		err := jobDB.Setup(ReadWrite, true, strings.ToLower(rand.String(5)), []prebackup.Handler{}, fileuploader.NewDefaultProvider())
 		require.NoError(t, err)
 		defer jobDB.TearDown()
 
@@ -331,7 +335,7 @@ func TestJobsDB(t *testing.T) {
 		triggerAddNewDS <- time.Now() // Second time, waits for the first loop to finish
 
 		payloadLimit := 3 * payloadSize
-		payloadLimitList, err := jobDB.GetUnprocessed(context.Background(), GetQueryParamsT{
+		payloadLimitList, err := jobDB.GetUnprocessed(context.Background(), GetQueryParams{
 			CustomValFilters: []string{customVal},
 			JobsLimit:        100,
 			PayloadSizeLimit: payloadLimit,
@@ -347,14 +351,14 @@ func TestJobsDB(t *testing.T) {
 		customVal := "MOCKDS"
 		triggerAddNewDS := make(chan time.Time)
 
-		maxDSSize := 1
-		jobDB := HandleT{
-			MaxDSSize: &maxDSSize,
+		c.Set("jobsdb.maxDSSize", 1)
+		jobDB := Handle{
 			TriggerAddNewDS: func() <-chan time.Time {
 				return triggerAddNewDS
 			},
+			config: c,
 		}
-		err := jobDB.Setup(ReadWrite, false, strings.ToLower(rand.String(5)), true, []prebackup.Handler{}, fileuploader.NewDefaultProvider())
+		err := jobDB.Setup(ReadWrite, false, strings.ToLower(rand.String(5)), []prebackup.Handler{}, fileuploader.NewDefaultProvider())
 		require.NoError(t, err)
 		defer jobDB.TearDown()
 
@@ -364,7 +368,7 @@ func TestJobsDB(t *testing.T) {
 		require.NoError(t, err)
 
 		payloadLimit := payloadSize / 2
-		payloadLimitList, err := jobDB.GetUnprocessed(context.Background(), GetQueryParamsT{
+		payloadLimitList, err := jobDB.GetUnprocessed(context.Background(), GetQueryParams{
 			CustomValFilters: []string{customVal},
 			JobsLimit:        100,
 			PayloadSizeLimit: payloadLimit,
@@ -380,14 +384,14 @@ func TestJobsDB(t *testing.T) {
 		customVal := "MOCKDS"
 		triggerAddNewDS := make(chan time.Time)
 
-		maxDSSize := 1
-		jobDB := HandleT{
-			MaxDSSize: &maxDSSize,
+		c.Set("jobsdb.maxDSSize", 1)
+		jobDB := Handle{
+			config: c,
 			TriggerAddNewDS: func() <-chan time.Time {
 				return triggerAddNewDS
 			},
 		}
-		err := jobDB.Setup(ReadWrite, true, strings.ToLower(rand.String(5)), true, []prebackup.Handler{}, fileuploader.NewDefaultProvider())
+		err := jobDB.Setup(ReadWrite, true, strings.ToLower(rand.String(5)), []prebackup.Handler{}, fileuploader.NewDefaultProvider())
 		require.NoError(t, err)
 		defer jobDB.TearDown()
 
@@ -395,7 +399,7 @@ func TestJobsDB(t *testing.T) {
 		require.NoError(t, jobDB.Store(context.Background(), jobs))
 
 		eventCountLimit := 1
-		eventLimitList, err := jobDB.GetUnprocessed(context.Background(), GetQueryParamsT{
+		eventLimitList, err := jobDB.GetUnprocessed(context.Background(), GetQueryParams{
 			CustomValFilters: []string{customVal},
 			JobsLimit:        100,
 			EventsLimit:      eventCountLimit,
@@ -411,15 +415,15 @@ func TestJobsDB(t *testing.T) {
 		customVal := "MOCKDS"
 		triggerAddNewDS := make(chan time.Time)
 
-		maxDSSize := 4
-		jobDB := HandleT{
-			MaxDSSize: &maxDSSize,
+		c.Set("jobsdb.maxDSSize", 4)
+		jobDB := Handle{
+			config: c,
 			TriggerAddNewDS: func() <-chan time.Time {
 				return triggerAddNewDS
 			},
 		}
 
-		err := jobDB.Setup(ReadWrite, true, strings.ToLower(rand.String(5)), true, []prebackup.Handler{}, fileuploader.NewDefaultProvider())
+		err := jobDB.Setup(ReadWrite, true, strings.ToLower(rand.String(5)), []prebackup.Handler{}, fileuploader.NewDefaultProvider())
 		require.NoError(t, err)
 		defer jobDB.TearDown()
 
@@ -437,7 +441,7 @@ func TestJobsDB(t *testing.T) {
 		triggerAddNewDS <- time.Now() // Second time, waits for the first loop to finish
 
 		eventCountLimit := 10
-		eventLimitList, err := jobDB.GetUnprocessed(context.Background(), GetQueryParamsT{
+		eventLimitList, err := jobDB.GetUnprocessed(context.Background(), GetQueryParams{
 			CustomValFilters: []string{customVal},
 			JobsLimit:        100,
 			EventsLimit:      eventCountLimit,
@@ -453,17 +457,18 @@ func TestJobsDB(t *testing.T) {
 		customVal := "MOCKDS"
 		triggerAddNewDS := make(chan time.Time)
 
-		jobDB := HandleT{
+		jobDB := Handle{
 			TriggerAddNewDS: func() <-chan time.Time {
 				return triggerAddNewDS
 			},
+			config: c,
 		}
 
-		err := jobDB.Setup(ReadWrite, true, strings.ToLower(rand.String(5)), true, []prebackup.Handler{}, fileuploader.NewDefaultProvider())
+		tablePrefix := strings.ToLower(rand.String(5))
+		c.Set(fmt.Sprintf("JobsDB.%s.maxDSRetention", tablePrefix), "1s")
+		err := jobDB.Setup(ReadWrite, true, tablePrefix, []prebackup.Handler{}, fileuploader.NewDefaultProvider())
 		require.NoError(t, err)
 		defer jobDB.TearDown()
-
-		jobDB.MaxDSRetentionPeriod = time.Second
 
 		jobs := genJobs(defaultWorkspaceID, customVal, 1, 1)
 		require.NoError(t, jobDB.Store(context.Background(), jobs))
@@ -481,20 +486,22 @@ func TestJobsDB(t *testing.T) {
 		triggerAddNewDS := make(chan time.Time)
 		triggerMigrateDS := make(chan time.Time)
 
-		jobDB := HandleT{
+		c := config.New()
+		jobDB := Handle{
 			TriggerAddNewDS: func() <-chan time.Time {
 				return triggerAddNewDS
 			},
 			TriggerMigrateDS: func() <-chan time.Time {
 				return triggerMigrateDS
 			},
+			config: c,
 		}
 
-		err := jobDB.Setup(ReadWrite, true, strings.ToLower(rand.String(5)), true, []prebackup.Handler{}, fileuploader.NewDefaultProvider())
+		tablePrefix := strings.ToLower(rand.String(5))
+		c.Set(fmt.Sprintf("JobsDB.%s.maxDSRetention", tablePrefix), "1s")
+		err := jobDB.Setup(ReadWrite, true, tablePrefix, []prebackup.Handler{}, fileuploader.NewDefaultProvider())
 		require.NoError(t, err)
 		defer jobDB.TearDown()
-
-		jobDB.MaxDSRetentionPeriod = time.Second
 
 		jobs := genJobs(defaultWorkspaceID, customVal, 10, 1)
 		require.NoError(t, jobDB.Store(context.Background(), jobs))
@@ -504,14 +511,14 @@ func TestJobsDB(t *testing.T) {
 		triggerAddNewDS <- time.Now() // trigger addNewDSLoop to run
 		triggerAddNewDS <- time.Now() // Second time, waits for the first loop to finish
 
-		jobDBInspector := HandleInspector{HandleT: &jobDB}
+		jobDBInspector := HandleInspector{Handle: &jobDB}
 		require.EqualValues(t, 2, len(jobDBInspector.DSIndicesList()))
 		require.EqualValues(t, 2, jobDB.GetMaxDSIndex())
 
 		jobs = genJobs(defaultWorkspaceID, customVal, 10, 1)
 		require.NoError(t, jobDB.Store(context.Background(), jobs)) // store in 2nd dataset
 
-		jobsResult, err := jobDB.GetUnprocessed(context.Background(), GetQueryParamsT{
+		jobsResult, err := jobDB.GetUnprocessed(context.Background(), GetQueryParams{
 			CustomValFilters: []string{customVal},
 			JobsLimit:        100,
 			ParameterFilters: []ParameterFilterT{},
@@ -545,7 +552,7 @@ func TestJobsDB(t *testing.T) {
 		require.EqualValues(t, 2, len(jobDBInspector.DSIndicesList()))
 		require.EqualValues(t, 2, jobDB.GetMaxDSIndex())
 
-		jobsResult, err = jobDB.GetUnprocessed(context.Background(), GetQueryParamsT{
+		jobsResult, err = jobDB.GetUnprocessed(context.Background(), GetQueryParams{
 			CustomValFilters: []string{customVal},
 			JobsLimit:        100,
 			ParameterFilters: []ParameterFilterT{},
@@ -564,20 +571,21 @@ func TestJobsDB(t *testing.T) {
 			triggerMigrateDS <- time.Now() // Second time, waits for the first loop to finish
 		}
 
-		maxDSSize := 10
-		jobDoneMigrateThres = 0.7
-		jobMinRowsMigrateThres = 0.6
-		jobDB := HandleT{
-			MaxDSSize: &maxDSSize,
+		c.Set("jobsdb.maxDSSize", 10)
+
+		jobDB := Handle{
 			TriggerAddNewDS: func() <-chan time.Time {
 				return triggerAddNewDS
 			},
 			TriggerMigrateDS: func() <-chan time.Time {
 				return triggerMigrateDS
 			},
+			config: c,
 		}
 		prefix := strings.ToLower(rand.String(5))
-		err := jobDB.Setup(ReadWrite, true, prefix, true, []prebackup.Handler{}, fileuploader.NewDefaultProvider())
+		c.Set("JobsDB.jobDoneMigrateThreshold", 0.7)
+		c.Set("JobsDB.jobMinRowsMigrateThreshold", 0.6)
+		err := jobDB.Setup(ReadWrite, true, prefix, []prebackup.Handler{}, fileuploader.NewDefaultProvider())
 		require.NoError(t, err)
 		defer jobDB.TearDown()
 
@@ -607,7 +615,7 @@ func TestJobsDB(t *testing.T) {
 		require.Equal(t, prefix+"_jobs_4", dsList[3].JobTable)
 		require.Equal(t, prefix+"_jobs_5", dsList[4].JobTable)
 
-		jobsResult, err := jobDB.GetUnprocessed(context.Background(), GetQueryParamsT{
+		jobsResult, err := jobDB.GetUnprocessed(context.Background(), GetQueryParams{
 			CustomValFilters: []string{customVal},
 			JobsLimit:        100,
 			ParameterFilters: []ParameterFilterT{},
@@ -650,7 +658,7 @@ func TestJobsDB(t *testing.T) {
 		require.Equal(t, prefix+"_jobs_5", dsList[4].JobTable)
 
 		// process some jobs
-		jobsResult, err = jobDB.GetUnprocessed(context.Background(), GetQueryParamsT{
+		jobsResult, err = jobDB.GetUnprocessed(context.Background(), GetQueryParams{
 			CustomValFilters: []string{customVal},
 			JobsLimit:        100,
 			ParameterFilters: []ParameterFilterT{},
@@ -685,20 +693,22 @@ func TestJobsDB(t *testing.T) {
 		triggerAddNewDS := make(chan time.Time)
 		triggerMigrateDS := make(chan time.Time)
 
-		jobDB := HandleT{
+		config.Reset()
+		c := config.New()
+		jobDB := Handle{
 			TriggerAddNewDS: func() <-chan time.Time {
 				return triggerAddNewDS
 			},
 			TriggerMigrateDS: func() <-chan time.Time {
 				return triggerMigrateDS
 			},
+			config: c,
 		}
 		tablePrefix := strings.ToLower(rand.String(5))
-		err := jobDB.Setup(ReadWrite, true, tablePrefix, true, []prebackup.Handler{}, fileuploader.NewDefaultProvider())
+		c.Set(fmt.Sprintf("JobsDB.%s.maxDSRetention", tablePrefix), "1s")
+		err := jobDB.Setup(ReadWrite, true, tablePrefix, []prebackup.Handler{}, fileuploader.NewDefaultProvider())
 		require.NoError(t, err)
 		defer jobDB.TearDown()
-
-		jobDB.MaxDSRetentionPeriod = time.Second
 
 		var (
 			numTotalJobs       = 30
@@ -724,9 +734,9 @@ func TestJobsDB(t *testing.T) {
 			),
 		)
 
-		unprocessedBeforeMigration, err := jobDB.GetUnprocessed(context.Background(), GetQueryParamsT{JobsLimit: 100})
+		unprocessedBeforeMigration, err := jobDB.GetUnprocessed(context.Background(), GetQueryParams{JobsLimit: 100})
 		require.NoError(t, err)
-		failedBeforeMigration, err := jobDB.GetToRetry(context.Background(), GetQueryParamsT{JobsLimit: 100})
+		failedBeforeMigration, err := jobDB.GetFailed(context.Background(), GetQueryParams{JobsLimit: 100})
 		require.NoError(t, err)
 
 		require.EqualValues(t, 1, jobDB.GetMaxDSIndex())
@@ -734,7 +744,7 @@ func TestJobsDB(t *testing.T) {
 		triggerAddNewDS <- time.Now() // trigger addNewDSLoop to run
 		triggerAddNewDS <- time.Now() // Second time, waits for the first loop to finish
 
-		jobDBInspector := HandleInspector{HandleT: &jobDB}
+		jobDBInspector := HandleInspector{Handle: &jobDB}
 		require.EqualValues(t, 2, len(jobDBInspector.DSIndicesList()))
 		require.EqualValues(t, 2, jobDB.GetMaxDSIndex())
 
@@ -771,7 +781,7 @@ func TestJobsDB(t *testing.T) {
 		require.Greater(t, nextSeqVal, maxJobStatusID)
 
 		// verify that unprocessed jobs are migrated to new DS
-		unprocessedResult, err := jobDB.GetUnprocessed(context.Background(), GetQueryParamsT{
+		unprocessedResult, err := jobDB.GetUnprocessed(context.Background(), GetQueryParams{
 			CustomValFilters: []string{customVal},
 			JobsLimit:        100,
 			ParameterFilters: []ParameterFilterT{},
@@ -781,7 +791,7 @@ func TestJobsDB(t *testing.T) {
 		require.EqualValues(t, unprocessedBeforeMigration.Jobs, unprocessedResult.Jobs)
 
 		// verifying that failed jobs are migrated to new DS
-		failedResult, err := jobDB.GetToRetry(context.Background(), GetQueryParamsT{
+		failedResult, err := jobDB.GetFailed(context.Background(), GetQueryParams{
 			CustomValFilters: []string{customVal},
 			JobsLimit:        100,
 			ParameterFilters: []ParameterFilterT{},
@@ -795,20 +805,20 @@ func TestJobsDB(t *testing.T) {
 func TestMultiTenantLegacyGetAllJobs(t *testing.T) {
 	_ = startPostgres(t)
 	triggerAddNewDS := make(chan time.Time)
-	maxDSSize := 10
-	jobDB := HandleT{
-		MaxDSSize: &maxDSSize,
+	config.Reset()
+	c := config.New()
+	c.Set("jobsdb.maxDSSize", 10)
+	jobDB := Handle{
+		config: c,
 		TriggerAddNewDS: func() <-chan time.Time {
 			return triggerAddNewDS
 		},
 	}
 
 	customVal := "MTL"
-	err := jobDB.Setup(ReadWrite, false, strings.ToLower(rand.String(5)), true, []prebackup.Handler{}, fileuploader.NewDefaultProvider())
+	err := jobDB.Setup(ReadWrite, false, strings.ToLower(rand.String(5)), []prebackup.Handler{}, fileuploader.NewDefaultProvider())
 	require.NoError(t, err)
 	defer jobDB.TearDown()
-
-	mtl := MultiTenantLegacy{HandleT: &jobDB}
 
 	eventsPerJob := 10
 	// Create 30 jobs
@@ -816,7 +826,7 @@ func TestMultiTenantLegacyGetAllJobs(t *testing.T) {
 	require.NoError(t, jobDB.Store(context.Background(), jobs))
 	payloadSize, err := getPayloadSize(t, &jobDB, jobs[0])
 	require.NoError(t, err)
-	j, err := jobDB.GetUnprocessed(context.Background(), GetQueryParamsT{JobsLimit: 100}) // read to get Ids
+	j, err := jobDB.GetUnprocessed(context.Background(), GetQueryParams{JobsLimit: 100}) // read to get Ids
 	require.NoError(t, err, "failed to get unprocessed jobs")
 	jobs = j.Jobs
 	require.Equal(t, 30, len(jobs), "should get all 30 jobs")
@@ -828,153 +838,50 @@ func TestMultiTenantLegacyGetAllJobs(t *testing.T) {
 	require.NoError(t, jobDB.UpdateJobStatus(context.Background(), genJobStatuses(jobs[10:20], Waiting.State), []string{customVal}, []ParameterFilterT{}))
 
 	t.Run("GetAllJobs with large limits", func(t *testing.T) {
-		params := GetQueryParamsT{JobsLimit: 30}
-		allJobs, err := mtl.GetAllJobs(context.Background(), map[string]int{defaultWorkspaceID: 30}, params, 0, nil)
+		params := GetQueryParams{JobsLimit: 30}
+		allJobs, err := jobDB.GetToProcess(context.Background(), params, nil)
 		require.NoError(t, err, "failed to get all jobs")
 		require.Equal(t, 30, len(allJobs.Jobs), "should get all 30 jobs")
 	})
 
 	t.Run("GetAllJobs with only jobs limit", func(t *testing.T) {
 		jobsLimit := 10
-		params := GetQueryParamsT{JobsLimit: 10}
-		allJobs, err := mtl.GetAllJobs(context.Background(), map[string]int{defaultWorkspaceID: jobsLimit}, params, 0, nil)
+		params := GetQueryParams{JobsLimit: jobsLimit}
+		allJobs, err := jobDB.GetToProcess(context.Background(), params, nil)
 		require.NoError(t, err, "failed to get all jobs")
 		require.Truef(t, len(allJobs.Jobs)-jobsLimit == 0, "should get %d jobs", jobsLimit)
 	})
 
 	t.Run("GetAllJobs with events limit", func(t *testing.T) {
 		jobsLimit := 10
-		params := GetQueryParamsT{JobsLimit: 10, EventsLimit: 3 * eventsPerJob}
-		allJobs, err := mtl.GetAllJobs(context.Background(), map[string]int{defaultWorkspaceID: jobsLimit}, params, 0, nil)
+		params := GetQueryParams{JobsLimit: jobsLimit, EventsLimit: 3 * eventsPerJob}
+		allJobs, err := jobDB.GetToProcess(context.Background(), params, nil)
 		require.NoError(t, err, "failed to get all jobs")
 		require.Equal(t, 3, len(allJobs.Jobs), "should get 3 jobs")
 	})
 
 	t.Run("GetAllJobs with events limit less than the events of the first job get one job", func(t *testing.T) {
 		jobsLimit := 10
-		params := GetQueryParamsT{JobsLimit: jobsLimit, EventsLimit: eventsPerJob - 1}
-		allJobs, err := mtl.GetAllJobs(context.Background(), map[string]int{defaultWorkspaceID: jobsLimit}, params, 0, nil)
+		params := GetQueryParams{JobsLimit: jobsLimit, EventsLimit: eventsPerJob - 1}
+		allJobs, err := jobDB.GetToProcess(context.Background(), params, nil)
 		require.NoError(t, err, "failed to get all jobs")
 		require.Equal(t, 1, len(allJobs.Jobs), "should get 1 overflown job")
 	})
 
 	t.Run("GetAllJobs with payload limit", func(t *testing.T) {
 		jobsLimit := 10
-		params := GetQueryParamsT{JobsLimit: jobsLimit, PayloadSizeLimit: 3 * payloadSize}
-		allJobs, err := mtl.GetAllJobs(context.Background(), map[string]int{defaultWorkspaceID: jobsLimit}, params, 0, nil)
+		params := GetQueryParams{JobsLimit: jobsLimit, PayloadSizeLimit: 3 * payloadSize}
+		allJobs, err := jobDB.GetToProcess(context.Background(), params, nil)
 		require.NoError(t, err, "failed to get all jobs")
 		require.Equal(t, 3, len(allJobs.Jobs), "should get 3 jobs")
 	})
 
 	t.Run("GetAllJobs with payload limit less than the payload size should get one job", func(t *testing.T) {
 		jobsLimit := 10
-		params := GetQueryParamsT{JobsLimit: jobsLimit, PayloadSizeLimit: payloadSize - 1}
-		allJobs, err := mtl.GetAllJobs(context.Background(), map[string]int{defaultWorkspaceID: jobsLimit}, params, 0, nil)
+		params := GetQueryParams{JobsLimit: jobsLimit, PayloadSizeLimit: payloadSize - 1}
+		allJobs, err := jobDB.GetToProcess(context.Background(), params, nil)
 		require.NoError(t, err, "failed to get all jobs")
 		require.Equal(t, 1, len(allJobs.Jobs), "should get 1 overflown job")
-	})
-}
-
-func TestMultiTenantGetAllJobs(t *testing.T) {
-	_ = startPostgres(t)
-	triggerAddNewDS := make(chan time.Time)
-	maxDSSize := 10
-	jobDB := HandleT{
-		MaxDSSize: &maxDSSize,
-		TriggerAddNewDS: func() <-chan time.Time {
-			return triggerAddNewDS
-		},
-	}
-
-	customVal := "MT"
-	err := jobDB.Setup(ReadWrite, false, strings.ToLower(rand.String(5)), true, []prebackup.Handler{}, fileuploader.NewDefaultProvider())
-	require.NoError(t, err)
-	defer jobDB.TearDown()
-
-	mtl := MultiTenantHandleT{HandleT: &jobDB}
-
-	eventsPerJob := 10
-
-	const (
-		workspaceA = "workspaceA"
-		workspaceB = "workspaceB"
-		workspaceC = "workspaceC"
-	)
-	// Create 30 jobs in each of 3 workspaces
-	jobs := genJobs(workspaceA, customVal, 30, eventsPerJob)
-	require.NoError(t, jobDB.Store(context.Background(), jobs))
-	payloadSize, err := getPayloadSize(t, &jobDB, jobs[0])
-	require.NoError(t, err)
-	jobs = genJobs(workspaceB, customVal, 30, eventsPerJob)
-	require.NoError(t, jobDB.Store(context.Background(), jobs))
-	jobs = genJobs(workspaceC, customVal, 30, eventsPerJob)
-	require.NoError(t, jobDB.Store(context.Background(), jobs))
-
-	unprocessedJobs, err := jobDB.GetUnprocessed(context.Background(), GetQueryParamsT{JobsLimit: 90}) // read to get all Ids
-	require.NoError(t, err, "failed to get unprocessed jobs")
-	allJobs := unprocessedJobs.Jobs
-	require.Equal(t, 90, len(allJobs), "should get all 90 jobs")
-	workspaceAJobs := filterWorkspaceJobs(allJobs, workspaceA)
-	workspaceBJobs := filterWorkspaceJobs(allJobs, workspaceB)
-	workspaceCJobs := filterWorkspaceJobs(allJobs, workspaceC)
-
-	// Mark 1-10 as failed for each workspace
-	require.NoError(t, jobDB.UpdateJobStatus(context.Background(), genJobStatuses(workspaceAJobs[0:10], Failed.State), []string{customVal}, []ParameterFilterT{}))
-	require.NoError(t, jobDB.UpdateJobStatus(context.Background(), genJobStatuses(workspaceBJobs[0:10], Failed.State), []string{customVal}, []ParameterFilterT{}))
-	require.NoError(t, jobDB.UpdateJobStatus(context.Background(), genJobStatuses(workspaceCJobs[0:10], Failed.State), []string{customVal}, []ParameterFilterT{}))
-
-	// Mark 11-20 as waiting for each workspace
-	require.NoError(t, jobDB.UpdateJobStatus(context.Background(), genJobStatuses(workspaceAJobs[10:20], Waiting.State), []string{customVal}, []ParameterFilterT{}))
-	require.NoError(t, jobDB.UpdateJobStatus(context.Background(), genJobStatuses(workspaceBJobs[10:20], Waiting.State), []string{customVal}, []ParameterFilterT{}))
-	require.NoError(t, jobDB.UpdateJobStatus(context.Background(), genJobStatuses(workspaceCJobs[10:20], Waiting.State), []string{customVal}, []ParameterFilterT{}))
-
-	t.Run("GetAllJobs with large limits", func(t *testing.T) {
-		workspaceLimits := map[string]int{
-			workspaceA: 30,
-			workspaceB: 30,
-			workspaceC: 30,
-		}
-		params := GetQueryParamsT{JobsLimit: 90}
-		allJobs, err := mtl.GetAllJobs(context.Background(), workspaceLimits, params, 100, nil)
-		require.NoError(t, err, "failed to get all jobs")
-		require.Equal(t, 90, len(allJobs.Jobs), "should get all 90 jobs")
-	})
-
-	t.Run("GetAllJobs with only jobs limit", func(t *testing.T) {
-		jobsLimit := 10
-		workspaceLimits := map[string]int{
-			workspaceA: jobsLimit,
-			workspaceB: jobsLimit,
-			workspaceC: 0,
-		}
-		params := GetQueryParamsT{JobsLimit: jobsLimit * 2}
-		allJobs, err := mtl.GetAllJobs(context.Background(), workspaceLimits, params, 100, nil)
-		require.NoError(t, err, "failed to get all jobs")
-		require.Truef(t, len(allJobs.Jobs)-2*jobsLimit == 0, "should get %d jobs", 2*jobsLimit)
-	})
-
-	t.Run("GetAllJobs with payload limit", func(t *testing.T) {
-		workspaceLimits := map[string]int{
-			workspaceA: 30,
-			workspaceB: 30,
-			workspaceC: 30,
-		}
-		params := GetQueryParamsT{JobsLimit: 90, PayloadSizeLimit: 6 * payloadSize}
-		allJobs, err := mtl.GetAllJobs(context.Background(), workspaceLimits, params, 100, nil)
-		require.NoError(t, err, "failed to get all jobs")
-		require.Equal(t, 6+3, len(allJobs.Jobs), "should get limit jobs +1 (overflow) per workspace")
-	})
-
-	t.Run("GetAllJobs with payload limit less than the payload size should get one job", func(t *testing.T) {
-		workspaceLimits := map[string]int{
-			workspaceA: 30,
-			workspaceB: 30,
-			workspaceC: 30,
-		}
-		params := GetQueryParamsT{JobsLimit: 90, PayloadSizeLimit: payloadSize - 1}
-		allJobs, err := mtl.GetAllJobs(context.Background(), workspaceLimits, params, 100, nil)
-		require.NoError(t, err, "failed to get all jobs")
-		require.Equal(t, 3, len(allJobs.Jobs), "should get limit+1 jobs")
 	})
 }
 
@@ -982,12 +889,15 @@ func TestStoreAndUpdateStatusExceedingAnalyzeThreshold(t *testing.T) {
 	t.Setenv("RSERVER_JOBS_DB_ANALYZE_THRESHOLD", "0")
 	_ = startPostgres(t)
 
-	maxDSSize := 10
-	jobDB := HandleT{
-		MaxDSSize: &maxDSSize,
+	config.Reset()
+	c := config.New()
+	c.Set("jobsdb.maxDSSize", 10)
+
+	jobDB := Handle{
+		config: c,
 	}
 	customVal := "MOCKDS"
-	err := jobDB.Setup(ReadWrite, false, strings.ToLower(rand.String(5)), true, []prebackup.Handler{}, fileuploader.NewDefaultProvider())
+	err := jobDB.Setup(ReadWrite, false, strings.ToLower(rand.String(5)), []prebackup.Handler{}, fileuploader.NewDefaultProvider())
 	require.NoError(t, err)
 	defer jobDB.TearDown()
 	sampleTestJob := JobT{
@@ -1001,7 +911,7 @@ func TestStoreAndUpdateStatusExceedingAnalyzeThreshold(t *testing.T) {
 	}
 	err = jobDB.Store(context.Background(), []*JobT{&sampleTestJob})
 	require.NoError(t, err)
-	unprocessedJob, err := jobDB.GetUnprocessed(context.Background(), GetQueryParamsT{
+	unprocessedJob, err := jobDB.GetUnprocessed(context.Background(), GetQueryParams{
 		CustomValFilters: []string{customVal},
 		JobsLimit:        1,
 		ParameterFilters: []ParameterFilterT{},
@@ -1065,15 +975,16 @@ func TestCreateDS(t *testing.T) {
 			require.NoError(t, err)
 
 			triggerAddNewDS := make(chan time.Time)
-			maxDSSize := 1
-			jobDB := HandleT{
-				dbHandle:  postgresql.DB,
-				MaxDSSize: &maxDSSize,
+			c := config.New()
+			c.Set("jobsdb.maxDSSize", 1)
+			jobDB := Handle{
+				dbHandle: postgresql.DB,
+				config:   c,
 				TriggerAddNewDS: func() <-chan time.Time {
 					return triggerAddNewDS
 				},
 			}
-			err = jobDB.Setup(ReadWrite, false, prefix, true, []prebackup.Handler{}, fileuploader.NewDefaultProvider())
+			err = jobDB.Setup(ReadWrite, false, prefix, []prebackup.Handler{}, fileuploader.NewDefaultProvider())
 			require.NoError(t, err)
 			defer jobDB.TearDown()
 
@@ -1090,6 +1001,7 @@ func TestCreateDS(t *testing.T) {
 				require.NoError(t, err)
 				tableNames = append(tableNames, tableName)
 			}
+			require.NoError(t, tables.Err())
 			require.Equal(t, len(tableNames), 2, `should find two tables`)
 			require.Equal(t, tableNames[0], prefix+"_jobs_-2")
 			require.Equal(t, tableNames[1], prefix+"_jobs_-1")
@@ -1104,17 +1016,6 @@ func TestCreateDS(t *testing.T) {
 	})
 }
 
-func filterWorkspaceJobs(jobs []*JobT, workspaceId string) []*JobT {
-	var filtered []*JobT
-	for i := range jobs {
-		job := jobs[i]
-		if job.WorkspaceId == workspaceId {
-			filtered = append(filtered, job)
-		}
-	}
-	return filtered
-}
-
 func requireSequential(t *testing.T, jobs []*JobT) {
 	t.Helper()
 	t.Log("job ids should be sequential")
@@ -1126,14 +1027,15 @@ func requireSequential(t *testing.T, jobs []*JobT) {
 func TestJobsDB_IncompatiblePayload(t *testing.T) {
 	_ = startPostgres(t)
 	triggerAddNewDS := make(chan time.Time)
-	maxDSSize := 10
-	jobDB := HandleT{
-		MaxDSSize: &maxDSSize,
+	c := config.New()
+	c.Set("jobsdb.maxDSSize", 10)
+	jobDB := Handle{
+		config: c,
 		TriggerAddNewDS: func() <-chan time.Time {
 			return triggerAddNewDS
 		},
 	}
-	err := jobDB.Setup(ReadWrite, false, strings.ToLower(rand.String(5)), true, []prebackup.Handler{}, fileuploader.NewDefaultProvider())
+	err := jobDB.Setup(ReadWrite, false, strings.ToLower(rand.String(5)), []prebackup.Handler{}, fileuploader.NewDefaultProvider())
 	require.NoError(t, err)
 	defer jobDB.TearDown()
 	customVal := "MOCKDS"
@@ -1146,11 +1048,11 @@ func TestJobsDB_IncompatiblePayload(t *testing.T) {
 		WorkspaceId:  defaultWorkspaceID,
 		EventCount:   1,
 	}
-	errMap := jobDB.StoreWithRetryEach(context.Background(), []*JobT{&sampleTestJob})
+	errMap := jobDB.StoreEachBatchRetry(context.Background(), [][]*JobT{{&sampleTestJob}})
 	for _, val := range errMap {
 		require.Equal(t, "", val)
 	}
-	unprocessedJob, err := jobDB.GetUnprocessed(context.Background(), GetQueryParamsT{
+	unprocessedJob, err := jobDB.GetUnprocessed(context.Background(), GetQueryParams{
 		CustomValFilters: []string{customVal},
 		JobsLimit:        1,
 		ParameterFilters: []ParameterFilterT{},
@@ -1182,10 +1084,10 @@ func BenchmarkJobsdb(b *testing.B) {
 	concurrencies := []int{16, 64, 256, 512}
 
 	for _, concurrency := range concurrencies {
-		jobsDb1 := HandleT{}
+		jobsDb1 := Handle{}
 		b.Setenv("RSERVER_JOBS_DB_ENABLE_WRITER_QUEUE", "true")
 		b.Setenv("RSERVER_JOBS_DB_ENABLE_READER_QUEUE", "true")
-		err := jobsDb1.Setup(ReadWrite, true, "batch_rt", true, []prebackup.Handler{}, fileuploader.NewDefaultProvider())
+		err := jobsDb1.Setup(ReadWrite, true, "batch_rt", []prebackup.Handler{}, fileuploader.NewDefaultProvider())
 		require.NoError(b, err)
 
 		b.Run(fmt.Sprintf("store and consume %d jobs using %d stream(s) with reader writer queues", totalJobs, concurrency), func(b *testing.B) {
@@ -1193,11 +1095,11 @@ func BenchmarkJobsdb(b *testing.B) {
 		})
 		jobsDb1.TearDown()
 
-		jobsDb2 := HandleT{}
+		jobsDb2 := Handle{}
 		b.Setenv("RSERVER_JOBS_DB_ENABLE_WRITER_QUEUE", "false")
 		b.Setenv("RSERVER_JOBS_DB_ENABLE_READER_QUEUE", "false")
 		b.Setenv("RSERVER_JOBS_DB_GW_MAX_OPEN_CONNECTIONS", "64")
-		err = jobsDb2.Setup(ReadWrite, true, "batch_rt", true, []prebackup.Handler{}, fileuploader.NewDefaultProvider())
+		err = jobsDb2.Setup(ReadWrite, true, "batch_rt", []prebackup.Handler{}, fileuploader.NewDefaultProvider())
 		require.NoError(b, err)
 
 		b.Run(fmt.Sprintf("store and consume %d jobs using %d stream(s) without reader writer queues", totalJobs, concurrency), func(b *testing.B) {
@@ -1207,7 +1109,7 @@ func BenchmarkJobsdb(b *testing.B) {
 	}
 }
 
-func benchmarkJobsdbConcurrently(b *testing.B, jobsDB *HandleT, totalJobs, pageSize, concurrency int) {
+func benchmarkJobsdbConcurrently(b *testing.B, jobsDB *Handle, totalJobs, pageSize, concurrency int) {
 	b.StopTimer()
 	var start, end sync.WaitGroup
 	start.Add(1)
@@ -1248,7 +1150,7 @@ func benchmarkJobsdbConcurrently(b *testing.B, jobsDB *HandleT, totalJobs, pageS
 			g.Go(func() error {
 				start.Wait()
 				for {
-					unprocessedJob, err := jobsDB.GetUnprocessed(context.Background(), GetQueryParamsT{
+					unprocessedJob, err := jobsDB.GetUnprocessed(context.Background(), GetQueryParams{
 						CustomValFilters: []string{customVal},
 						JobsLimit:        pageSize,
 					})
@@ -1325,19 +1227,22 @@ func chunkJobs(slice []JobT, chunkSize int) [][]*JobT {
 
 func BenchmarkLifecycle(b *testing.B) {
 	_ = startPostgres(b)
-	jobDB := NewForReadWrite("test")
-	defer jobDB.TearDown()
+	c := config.New()
 
 	const writeConcurrency = 10
 	const newJobs = 100
 
 	dsSize := writeConcurrency * newJobs
+	c.Set("jobsdb.maxDSSize", dsSize)
 	triggerAddNewDS := make(chan time.Time)
 
-	jobDB.MaxDSSize = &dsSize
-	jobDB.TriggerAddNewDS = func() <-chan time.Time {
-		return triggerAddNewDS
+	jobDB := &Handle{
+		config: c,
+		TriggerAddNewDS: func() <-chan time.Time {
+			return triggerAddNewDS
+		},
 	}
+	defer jobDB.TearDown()
 
 	b.Run("Start, Work, Stop, Repeat", func(b *testing.B) {
 		for i := 0; i < b.N; i++ {
@@ -1362,10 +1267,10 @@ func BenchmarkLifecycle(b *testing.B) {
 	})
 }
 
-func consume(t testing.TB, db *HandleT, count int) {
+func consume(t testing.TB, db *Handle, count int) {
 	t.Helper()
 
-	unprocessedList, err := db.GetUnprocessed(context.Background(), GetQueryParamsT{
+	unprocessedList, err := db.GetUnprocessed(context.Background(), GetQueryParams{
 		JobsLimit: count,
 	})
 	require.NoError(t, err, "failed to get unprocessed jobs")
@@ -1401,6 +1306,7 @@ func getPayloadSize(t *testing.T, jobsDB JobsDB, job *JobT) (int64, error) {
 			require.NoError(t, err)
 			tables = append(tables, table)
 		}
+		require.NoError(t, rows.Err())
 		_ = rows.Close()
 
 		for _, table := range tables {

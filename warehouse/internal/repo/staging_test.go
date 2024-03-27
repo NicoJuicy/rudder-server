@@ -1,28 +1,27 @@
-//go:build !warehouse_integration
-
 package repo_test
 
 import (
 	"context"
-	"database/sql"
 	"fmt"
 	"testing"
 	"time"
 
 	"github.com/ory/dockertest/v3"
+	"github.com/stretchr/testify/require"
+
+	"github.com/rudderlabs/rudder-go-kit/testhelper/docker/resource/postgres"
 	migrator "github.com/rudderlabs/rudder-server/services/sql-migrator"
-	"github.com/rudderlabs/rudder-server/testhelper/destination"
+	sqlmiddleware "github.com/rudderlabs/rudder-server/warehouse/integrations/middleware/sqlquerywrapper"
 	"github.com/rudderlabs/rudder-server/warehouse/internal/model"
 	"github.com/rudderlabs/rudder-server/warehouse/internal/repo"
 	warehouseutils "github.com/rudderlabs/rudder-server/warehouse/utils"
-	"github.com/stretchr/testify/require"
 )
 
-func setupDB(t *testing.T) *sql.DB {
+func setupDB(t testing.TB) *sqlmiddleware.DB {
 	pool, err := dockertest.NewPool("")
 	require.NoError(t, err)
 
-	pgResource, err := destination.SetupPostgres(pool, t)
+	pgResource, err := postgres.Setup(pool, t)
 	require.NoError(t, err)
 
 	err = (&migrator.Migrator{
@@ -31,7 +30,9 @@ func setupDB(t *testing.T) *sql.DB {
 	}).Migrate("warehouse")
 	require.NoError(t, err)
 
-	return pgResource.DB
+	t.Log("db:", pgResource.DBDsn)
+
+	return sqlmiddleware.New(pgResource.DB)
 }
 
 func TestStagingFileRepo(t *testing.T) {
@@ -39,12 +40,11 @@ func TestStagingFileRepo(t *testing.T) {
 
 	now := time.Now().Truncate(time.Second).UTC()
 
-	r := repo.StagingFiles{
-		DB: setupDB(t),
-		Now: func() time.Time {
+	r := repo.NewStagingFiles(setupDB(t),
+		repo.WithNow(func() time.Time {
 			return now
-		},
-	}
+		}),
+	)
 
 	testcases := []struct {
 		name        string
@@ -64,8 +64,6 @@ func TestStagingFileRepo(t *testing.T) {
 				UseRudderStorage:      true,
 				DestinationRevisionID: "destination_revision_id",
 				TotalEvents:           100,
-				SourceBatchID:         "source_batch_id",
-				SourceTaskID:          "source_task_id",
 				SourceTaskRunID:       "source_task_run_id",
 				SourceJobID:           "source_job_id",
 				SourceJobRunID:        "source_job_run_id",
@@ -85,8 +83,6 @@ func TestStagingFileRepo(t *testing.T) {
 				UseRudderStorage:      true,
 				DestinationRevisionID: "destination_revision_id",
 				TotalEvents:           100,
-				SourceBatchID:         "source_batch_id",
-				SourceTaskID:          "source_task_id",
 				SourceTaskRunID:       "source_task_run_id",
 				SourceJobID:           "source_job_id",
 				SourceJobRunID:        "source_job_run_id",
@@ -106,8 +102,6 @@ func TestStagingFileRepo(t *testing.T) {
 				UseRudderStorage:      true,
 				DestinationRevisionID: "destination_revision_id",
 				TotalEvents:           100,
-				SourceBatchID:         "source_batch_id",
-				SourceTaskID:          "source_task_id",
 				SourceTaskRunID:       "source_task_run_id",
 				SourceJobID:           "source_job_id",
 				SourceJobRunID:        "source_job_run_id",
@@ -132,11 +126,6 @@ func TestStagingFileRepo(t *testing.T) {
 			expected.UpdatedAt = now
 
 			require.Equal(t, expected.StagingFile, retrieved)
-
-			schema, err := r.GetSchemaByID(ctx, id)
-			require.NoError(t, err)
-
-			require.Equal(t, expected.Schema, schema)
 		})
 	}
 
@@ -146,22 +135,10 @@ func TestStagingFileRepo(t *testing.T) {
 	})
 }
 
-func TestStagingFileRepo_Many(t *testing.T) {
-	ctx := context.Background()
-
-	now := time.Now().Truncate(time.Second).UTC()
-
-	r := repo.StagingFiles{
-		DB: setupDB(t),
-		Now: func() time.Time {
-			return now
-		},
-	}
-
-	var stagingFiles []model.StagingFile
-	n := 10
-	for i := 0; i < n; i++ {
-		file := model.StagingFile{
+func manyStagingFiles(size int, now time.Time) []*model.StagingFile {
+	files := make([]*model.StagingFile, size)
+	for i := range files {
+		files[i] = &model.StagingFile{
 			WorkspaceID:           "workspace_id",
 			Location:              fmt.Sprintf("s3://bucket/path/to/file-%d", i),
 			SourceID:              "source_id",
@@ -173,165 +150,255 @@ func TestStagingFileRepo_Many(t *testing.T) {
 			UseRudderStorage:      true,
 			DestinationRevisionID: "destination_revision_id",
 			TotalEvents:           100,
-			SourceBatchID:         "source_batch_id",
-			SourceTaskID:          "source_task_id",
 			SourceTaskRunID:       "source_task_run_id",
 			SourceJobID:           "source_job_id",
 			SourceJobRunID:        "source_job_run_id",
 			TimeWindow:            time.Date(1993, 8, 1, 3, 0, 0, 0, time.UTC),
-		}.WithSchema([]byte(`{"type": "object"}`))
+		}
+	}
+	return files
+}
 
+func TestStagingFileRepo_Many(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+
+	now := time.Now().Truncate(time.Second).UTC()
+	db := setupDB(t)
+	r := repo.NewStagingFiles(db,
+		repo.WithNow(func() time.Time {
+			return now
+		}),
+	)
+
+	stagingFiles := manyStagingFiles(10, now)
+	for i := range stagingFiles {
+		file := stagingFiles[i].WithSchema([]byte(`{"table": {"column": "type"} }`))
 		id, err := r.Insert(ctx, &file)
 		require.NoError(t, err)
-
-		file.ID = id
-		file.Error = nil
-		file.CreatedAt = now
-		file.UpdatedAt = now
-
-		stagingFiles = append(stagingFiles, file.StagingFile)
+		stagingFiles[i].ID = id
+		stagingFiles[i].Error = nil
+		stagingFiles[i].CreatedAt = now
+		stagingFiles[i].UpdatedAt = now
 	}
 
-	t.Run("GetInRange", func(t *testing.T) {
+	t.Run("GetForUploadID", func(t *testing.T) {
 		t.Parallel()
-
+		u := repo.NewUploads(db)
+		uploadId, err := u.CreateWithStagingFiles(ctx, model.Upload{}, stagingFiles)
+		require.NoError(t, err)
 		testcases := []struct {
 			name          string
 			sourceID      string
 			destinationID string
-			startID       int64
-			endID         int64
-
-			expected []model.StagingFile
+			uploadId      int64
+			expected      []*model.StagingFile
 		}{
 			{
 				name:          "get all",
 				sourceID:      "source_id",
 				destinationID: "destination_id",
-				startID:       0,
-				endID:         10,
-
-				expected: stagingFiles,
-			},
-			{
-				name:          "get all with start id",
-				sourceID:      "source_id",
-				destinationID: "destination_id",
-				startID:       5,
-				endID:         10,
-
-				expected: stagingFiles[4:],
-			},
-			{
-				name:          "get all with end id",
-				sourceID:      "source_id",
-				destinationID: "destination_id",
-				startID:       0,
-				endID:         5,
-
-				expected: stagingFiles[:5],
+				uploadId:      uploadId,
+				expected:      stagingFiles,
 			},
 			{
 				name:          "missing source id",
 				sourceID:      "bad_source_id",
 				destinationID: "destination_id",
-				startID:       0,
-				endID:         10,
-
-				expected: []model.StagingFile(nil),
+				uploadId:      uploadId,
+				expected:      []*model.StagingFile(nil),
 			},
 			{
 				name:          "missing destination id",
 				sourceID:      "source_id",
 				destinationID: "bad_destination_id",
-				startID:       0,
-				endID:         10,
-
-				expected: []model.StagingFile(nil),
+				uploadId:      uploadId,
+				expected:      []*model.StagingFile(nil),
 			},
 		}
-
 		for _, tc := range testcases {
 			tc := tc
 			t.Run(tc.name, func(t *testing.T) {
 				t.Parallel()
-				retrieved, err := r.GetInRange(ctx, tc.sourceID, tc.destinationID, tc.startID, tc.endID)
+				retrieved, err := r.GetForUploadID(ctx, tc.sourceID, tc.destinationID, tc.uploadId)
 				require.NoError(t, err)
-
 				require.Equal(t, tc.expected, retrieved)
 			})
 		}
 	})
 
-	t.Run("GetAfterID", func(t *testing.T) {
-		t.Parallel()
+	t.Run("GetSchemasByIDs", func(t *testing.T) {
+		t.Run("get all", func(t *testing.T) {
+			t.Parallel()
 
-		testcases := []struct {
-			name          string
-			sourceID      string
-			destinationID string
-			startID       int64
+			stagingIDs := repo.StagingFileIDs(stagingFiles)
+			expectedSchemas, err := r.GetSchemasByIDs(ctx, stagingIDs)
+			require.NoError(t, err)
+			require.Len(t, expectedSchemas, len(stagingFiles))
 
-			expected []model.StagingFile
-		}{
-			{
-				name:          "get all",
-				sourceID:      "source_id",
-				destinationID: "destination_id",
-				startID:       0,
+			for _, es := range expectedSchemas {
+				require.EqualValues(t, model.Schema{
+					"table": model.TableSchema{
+						"column": "type",
+					},
+				}, es)
+			}
+		})
 
-				expected: stagingFiles,
-			},
-			{
-				name:          "get all with start id",
-				sourceID:      "source_id",
-				destinationID: "destination_id",
-				startID:       5,
+		t.Run("missing id", func(t *testing.T) {
+			t.Parallel()
 
-				expected: stagingFiles[5:],
-			},
-			{
-				name:          "missing source id",
-				sourceID:      "bad_source_id",
-				destinationID: "destination_id",
-				startID:       0,
+			expectedSchemas, err := r.GetSchemasByIDs(ctx, []int64{1, 2, 3, 101, 102, 103})
+			require.EqualError(t, err, "cannot get schemas by ids: not all schemas were found")
+			require.Nil(t, expectedSchemas)
+		})
 
-				expected: []model.StagingFile(nil),
-			},
-			{
-				name:          "missing destination id",
-				sourceID:      "source_id",
-				destinationID: "bad_destination_id",
-				startID:       0,
+		t.Run("context canceled", func(t *testing.T) {
+			t.Parallel()
 
-				expected: []model.StagingFile(nil),
-			},
-		}
+			ctx, cancel := context.WithCancel(context.Background())
+			cancel()
 
-		for _, tc := range testcases {
-			tc := tc
-			t.Run(tc.name, func(t *testing.T) {
-				t.Parallel()
-				retrieved, err := r.GetAfterID(ctx, tc.sourceID, tc.destinationID, tc.startID)
-				require.NoError(t, err)
-				t.Log(retrieved, tc.expected)
-				require.Equal(t, tc.expected, retrieved)
-			})
-		}
+			stagingIDs := repo.StagingFileIDs(stagingFiles)
+			expectedSchemas, err := r.GetSchemasByIDs(ctx, stagingIDs)
+			require.ErrorIs(t, err, context.Canceled)
+			require.Nil(t, expectedSchemas)
+		})
+
+		t.Run("invalid JSON", func(t *testing.T) {
+			db := setupDB(t)
+
+			_, err := db.ExecContext(ctx, `
+				INSERT INTO wh_staging_files (
+				  location, source_id, destination_id,
+				  schema, created_at, updated_at, workspace_id
+				)
+				VALUES
+				  (
+					's3://bucket/path/to/file', 'source_id',
+					'destination_id', '1', NOW(), NOW(),
+					'workspace_id'
+				  );
+			`)
+			require.NoError(t, err)
+
+			r := repo.NewStagingFiles(db)
+
+			expectedSchemas, err := r.GetSchemasByIDs(ctx, []int64{1})
+			require.EqualError(t, err, "cannot get schemas by ids: unmarshal staging schema: ReadMapCB: expect { or n, but found 1, error found in #1 byte of ...|1|..., bigger context ...|1|...")
+			require.Nil(t, expectedSchemas)
+		})
 	})
 }
 
-func TestStagingFileRepo_Status(t *testing.T) {
+func TestStagingFileRepo_Pending(t *testing.T) {
 	ctx := context.Background()
 
 	now := time.Now().Truncate(time.Second).UTC()
 
-	r := repo.StagingFiles{
-		DB: setupDB(t),
-		Now: func() time.Time {
+	db := setupDB(t)
+	r := repo.NewStagingFiles(db,
+		repo.WithNow(func() time.Time {
 			return now
+		}),
+	)
+	uploadRepo := repo.NewUploads(db)
+
+	inputData := []struct {
+		SourceID      string
+		DestinationID string
+		Files         int
+	}{
+		{
+			SourceID:      "source_id_1",
+			DestinationID: "destination_id_1",
+			Files:         10,
+		},
+		{
+			SourceID:      "source_id_2",
+			DestinationID: "destination_id_2",
+			Files:         20,
+		},
+		{
+			SourceID:      "source_id_2",
+			DestinationID: "destination_id_3",
+			Files:         16,
 		},
 	}
+
+	for _, input := range inputData {
+		stagingFiles := manyStagingFiles(input.Files, now)
+		for i := range stagingFiles {
+			stagingFiles[i].DestinationID = input.DestinationID
+			stagingFiles[i].SourceID = input.SourceID
+
+			file := stagingFiles[i].WithSchema([]byte(`{"type": "object"}`))
+
+			id, err := r.Insert(ctx, &file)
+			require.NoError(t, err)
+
+			stagingFiles[i].ID = id
+			stagingFiles[i].Error = nil
+			stagingFiles[i].CreatedAt = now
+			stagingFiles[i].UpdatedAt = now
+		}
+		pending, err := r.Pending(ctx, input.SourceID, input.DestinationID)
+		require.NoError(t, err)
+		require.Equal(t, stagingFiles, pending)
+
+		countByDestID, err := r.CountPendingForDestination(ctx, input.DestinationID)
+		require.NoError(t, err)
+		require.Equal(t, int64(input.Files), countByDestID)
+
+		countBySrcID, err := r.CountPendingForSource(ctx, input.SourceID)
+		require.NoError(t, err)
+		require.Equal(t, int64(input.Files), countBySrcID)
+
+		uploadID, err := uploadRepo.CreateWithStagingFiles(ctx, model.Upload{
+			SourceID:      input.SourceID,
+			DestinationID: input.DestinationID,
+		}, pending)
+		require.NoError(t, err)
+
+		pending, err = r.Pending(ctx, input.SourceID, input.DestinationID)
+		require.NoError(t, err)
+		require.Empty(t, pending)
+
+		countByDestID, err = r.CountPendingForDestination(ctx, input.DestinationID)
+		require.NoError(t, err)
+		require.Zero(t, countByDestID)
+
+		countBySrcID, err = r.CountPendingForSource(ctx, input.SourceID)
+		require.NoError(t, err)
+		require.Zero(t, countBySrcID)
+
+		t.Run("Uploads", func(t *testing.T) {
+			upload, err := uploadRepo.Get(ctx, uploadID)
+			require.NoError(t, err)
+
+			events, err := r.TotalEventsForUpload(ctx, upload)
+			require.NoError(t, err)
+			require.Equal(t, int64(input.Files)*100, events)
+
+			firstEvent, err := r.FirstEventForUpload(ctx, upload)
+			require.NoError(t, err)
+			require.Equal(t, stagingFiles[0].FirstEventAt, firstEvent.UTC())
+
+			revisionIDs, err := r.DestinationRevisionIDs(ctx, upload)
+			require.NoError(t, err)
+			require.Equal(t, []string{"destination_revision_id"}, revisionIDs)
+		})
+	}
+}
+
+func TestStagingFileRepo_Status(t *testing.T) {
+	ctx := context.Background()
+	now := time.Now().Truncate(time.Second).UTC()
+	db := setupDB(t)
+	r := repo.NewStagingFiles(db, repo.WithNow(func() time.Time {
+		return now
+	}))
 
 	n := 10
 	for i := 0; i < n; i++ {
@@ -375,7 +442,7 @@ func TestStagingFileRepo_Status(t *testing.T) {
 				)
 				require.NoError(t, err)
 
-				files, err := r.GetInRange(ctx, "source_id", "destination_id", 0, 3)
+				files, err := r.GetForUploadID(ctx, "source_id", "destination_id", 1)
 				require.NoError(t, err)
 
 				for _, file := range files {
@@ -430,7 +497,58 @@ func TestStagingFileIDs(t *testing.T) {
 			ID: 3,
 		},
 	}
-
 	ids := repo.StagingFileIDs(sfs)
 	require.Equal(t, []int64{1, 2, 3}, ids)
+}
+
+func BenchmarkFiles(b *testing.B) {
+	ctx := context.Background()
+	db := setupDB(b)
+	stagingRepo := repo.NewStagingFiles(db)
+	uploadRepo := repo.NewUploads(db)
+
+	size := 100000
+	pending := 2
+
+	for i := 0; i < size; i++ {
+		file := model.StagingFile{
+			WorkspaceID:   "workspace_id",
+			Location:      fmt.Sprintf("s3://bucket/path/to/file-%d", i),
+			SourceID:      "source_id",
+			DestinationID: "destination_id",
+			Status:        warehouseutils.StagingFileWaitingState,
+			Error:         nil,
+			FirstEventAt:  time.Now(),
+			LastEventAt:   time.Now(),
+		}.WithSchema([]byte(`{"type": "object"}`))
+
+		id, err := stagingRepo.Insert(ctx, &file)
+		require.NoError(b, err)
+
+		if i >= (size - pending) {
+			continue
+		}
+
+		_, err = uploadRepo.CreateWithStagingFiles(ctx, model.Upload{
+			SourceID:      "source_id",
+			DestinationID: "destination_id",
+		}, []*model.StagingFile{
+			{
+				ID:            id,
+				SourceID:      "source_id",
+				DestinationID: "destination_id",
+			},
+		})
+		require.NoError(b, err)
+	}
+
+	b.ResetTimer()
+
+	b.Run("GetStagingFiles", func(b *testing.B) {
+		for i := 0; i < b.N; i++ {
+			ff, err := stagingRepo.Pending(ctx, "source_id", "destination_id")
+			require.NoError(b, err)
+			require.Equal(b, pending, len(ff))
+		}
+	})
 }
