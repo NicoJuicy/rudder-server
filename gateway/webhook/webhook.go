@@ -18,14 +18,16 @@ import (
 
 	"github.com/hashicorp/go-retryablehttp"
 	"github.com/samber/lo"
+	"github.com/tidwall/sjson"
 
 	"github.com/rudderlabs/rudder-go-kit/config"
+	kithttputil "github.com/rudderlabs/rudder-go-kit/httputil"
 	"github.com/rudderlabs/rudder-go-kit/logger"
 	"github.com/rudderlabs/rudder-go-kit/stats"
+
 	gwtypes "github.com/rudderlabs/rudder-server/gateway/internal/types"
 	"github.com/rudderlabs/rudder-server/gateway/response"
 	"github.com/rudderlabs/rudder-server/gateway/webhook/model"
-	"github.com/rudderlabs/rudder-server/utils/misc"
 )
 
 type webhookT struct {
@@ -64,8 +66,8 @@ type HandleT struct {
 	backgroundCancel context.CancelFunc
 
 	config struct {
-		webhookBatchTimeout        misc.ValueLoader[time.Duration]
-		maxWebhookBatchSize        misc.ValueLoader[int]
+		webhookBatchTimeout        config.ValueLoader[time.Duration]
+		maxWebhookBatchSize        config.ValueLoader[int]
 		sourceListForParsingParams []string
 	}
 }
@@ -98,7 +100,7 @@ func (webhook *HandleT) failRequest(w http.ResponseWriter, r *http.Request, reas
 	if code != 0 {
 		statusCode = code
 	}
-	webhook.logger.Infof("IP: %s -- %s -- Response: %d, %s", misc.GetIPFromReq(r), r.URL.Path, code, reason)
+	webhook.logger.Infof("IP: %s -- %s -- Response: %d, %s", kithttputil.GetRequestIP(r), r.URL.Path, code, reason)
 	http.Error(w, reason, statusCode)
 }
 
@@ -209,7 +211,7 @@ func (webhook *HandleT) RequestHandler(w http.ResponseWriter, r *http.Request) {
 		if resp.StatusCode != 0 {
 			code = resp.StatusCode
 		}
-		webhook.logger.Infof("IP: %s -- %s -- Response: %d, %s", misc.GetIPFromReq(r), r.URL.Path, code, resp.Err)
+		webhook.logger.Infof("IP: %s -- %s -- Response: %d, %s", kithttputil.GetRequestIP(r), r.URL.Path, code, resp.Err)
 		http.Error(w, resp.Err, code)
 		ss.RequestFailed("error")
 		ss.Report(webhook.stats)
@@ -221,7 +223,7 @@ func (webhook *HandleT) RequestHandler(w http.ResponseWriter, r *http.Request) {
 		payload = resp.OutputToSource.Body
 		w.Header().Set("Content-Type", resp.OutputToSource.ContentType)
 	}
-	webhook.logger.Debugf("IP: %s -- %s -- Response: 200, %s", misc.GetIPFromReq(r), r.URL.Path, response.GetStatus(response.Ok))
+	webhook.logger.Debugf("IP: %s -- %s -- Response: 200, %s", kithttputil.GetRequestIP(r), r.URL.Path, response.GetStatus(response.Ok))
 	_, _ = w.Write(payload)
 	ss.RequestSucceeded()
 	ss.Report(webhook.stats)
@@ -260,6 +262,35 @@ func (webhook *HandleT) batchRequests(sourceDef string, requestQ chan *webhookT)
 	}
 }
 
+func prepareRequestBody(req *http.Request, sourceType string, sourceListForParsingParams []string) ([]byte, error) {
+	defer func() {
+		_ = req.Body.Close()
+	}()
+
+	body, err := io.ReadAll(req.Body)
+	if err != nil {
+		return nil, errors.New(response.RequestBodyReadFailed)
+	}
+
+	if len(body) == 0 {
+		body = []byte("{}") // If body is empty, set it to an empty JSON object
+	}
+
+	if slices.Contains(sourceListForParsingParams, strings.ToLower(sourceType)) {
+		queryParams := req.URL.Query()
+		paramsBytes, err := json.Marshal(queryParams)
+		if err != nil {
+			return nil, errors.New(response.ErrorInMarshal)
+		}
+
+		body, err = sjson.SetRawBytes(body, "query_parameters", paramsBytes)
+		if err != nil {
+			return nil, errors.New(response.InvalidJSON)
+		}
+	}
+	return body, nil
+}
+
 // TODO : return back immediately for blank request body. its waiting till timeout
 func (bt *batchWebhookTransformerT) batchTransformLoop() {
 	for breq := range bt.webhook.batchRequestQ {
@@ -288,33 +319,11 @@ func (bt *batchWebhookTransformerT) batchTransformLoop() {
 		var payloadArr [][]byte
 		var webRequests []*webhookT
 		for _, req := range breq.batchRequest {
-			body, err := io.ReadAll(req.request.Body)
-			_ = req.request.Body.Close()
-
+			body, err := prepareRequestBody(req.request, breq.sourceType, bt.webhook.config.sourceListForParsingParams)
 			if err != nil {
-				req.done <- transformerResponse{Err: response.GetStatus(response.RequestBodyReadFailed)}
+				req.done <- transformerResponse{Err: response.GetStatus(err.Error())}
 				continue
 			}
-
-			if slices.Contains(bt.webhook.config.sourceListForParsingParams, strings.ToLower(breq.sourceType)) {
-				queryParams := req.request.URL.Query()
-				paramsBytes, err := json.Marshal(queryParams)
-				if err != nil {
-					req.done <- transformerResponse{Err: response.GetStatus(response.ErrorInMarshal)}
-					continue
-				}
-
-				closingBraceIdx := bytes.LastIndexByte(body, '}')
-				if closingBraceIdx == -1 {
-					req.done <- transformerResponse{Err: response.GetStatus(response.InvalidJSON)}
-					continue
-				}
-				appendData := []byte(`, "query_parameters": `)
-				appendData = append(appendData, paramsBytes...)
-				body = append(body[:closingBraceIdx], appendData...)
-				body = append(body, '}')
-			}
-
 			if !json.Valid(body) {
 				req.done <- transformerResponse{Err: response.GetStatus(response.InvalidJSON)}
 				continue

@@ -4,7 +4,6 @@ import (
 	"bufio"
 	"compress/gzip"
 	"context"
-	"encoding/json"
 	"os"
 	"testing"
 
@@ -85,7 +84,7 @@ func TestSlave(t *testing.T) {
 		subscribeCh: subscriberCh,
 	}
 
-	workers := misc.SingleValueLoader(4)
+	workers := config.SingleValueLoader(4)
 	workerJobs := 25
 
 	tenantManager := multitenant.New(

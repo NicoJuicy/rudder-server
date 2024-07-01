@@ -16,7 +16,11 @@ import (
 	"testing"
 	"time"
 
+	"github.com/rudderlabs/rudder-schemas/go/stream"
+	"github.com/rudderlabs/rudder-server/utils/httputil"
+
 	kithelper "github.com/rudderlabs/rudder-go-kit/testhelper"
+	kituuid "github.com/rudderlabs/rudder-go-kit/uuid"
 
 	"github.com/golang/mock/gomock"
 	"github.com/google/uuid"
@@ -30,6 +34,7 @@ import (
 	"github.com/rudderlabs/rudder-go-kit/logger"
 	"github.com/rudderlabs/rudder-go-kit/stats"
 	"github.com/rudderlabs/rudder-go-kit/stats/memstats"
+
 	"github.com/rudderlabs/rudder-server/admin"
 	"github.com/rudderlabs/rudder-server/app"
 	backendconfig "github.com/rudderlabs/rudder-server/backend-config"
@@ -44,6 +49,7 @@ import (
 	mocksJobsDB "github.com/rudderlabs/rudder-server/mocks/jobsdb"
 	mocksTypes "github.com/rudderlabs/rudder-server/mocks/utils/types"
 	sourcedebugger "github.com/rudderlabs/rudder-server/services/debugger/source"
+	mocksrcdebugger "github.com/rudderlabs/rudder-server/services/debugger/source/mocks"
 	"github.com/rudderlabs/rudder-server/services/rsources"
 	"github.com/rudderlabs/rudder-server/services/transformer"
 	"github.com/rudderlabs/rudder-server/utils/misc"
@@ -73,6 +79,8 @@ const (
 	RETLSourceType   = "retl"
 	sdkLibrary       = "sdkLibrary"
 	sdkVersion       = "v1.2.3"
+
+	writeKeyNotPresentInSource = "write-key-not-present-for-source"
 )
 
 var (
@@ -219,7 +227,7 @@ var _ = Describe("Reconstructing JSON for ServerSide SDK", func() {
 		                {"anonymousId":"anon_id_1","event":"event_1_3"}
 		            ]}`
 			response, payloadError := getUsersPayload([]byte(testValidBody))
-			key, err := misc.GetMD5UUID(inputKey)
+			key, err := kituuid.GetMD5UUID(inputKey)
 			Expect(string(response[key.String()])).To(Equal(value))
 			Expect(err).To(BeNil())
 			Expect(payloadError).To(BeNil())
@@ -271,7 +279,7 @@ var _ = Describe("Gateway Enterprise", func() {
 			Expect(err).To(BeNil())
 
 			gateway = &Handle{}
-			err = gateway.Setup(context.Background(), conf, logger.NOP, statsStore, c.mockApp, c.mockBackendConfig, c.mockJobsDB, c.mockErrJobsDB, nil, c.mockVersionHandler, rsources.NewNoOpService(), transformer.NewNoOpService(), sourcedebugger.NewNoOpService())
+			err = gateway.Setup(context.Background(), conf, logger.NOP, statsStore, c.mockApp, c.mockBackendConfig, c.mockJobsDB, c.mockErrJobsDB, nil, c.mockVersionHandler, rsources.NewNoOpService(), transformer.NewNoOpService(), sourcedebugger.NewNoOpService(), nil)
 			Expect(err).To(BeNil())
 
 			waitForBackendConfigInit(gateway)
@@ -396,7 +404,6 @@ var _ = Describe("Gateway", func() {
 		conf.Set("Gateway.enableEventSchemasFeature", false)
 		c = &testContext{}
 		c.Setup()
-		c.initializeAppFeatures()
 	})
 
 	AfterEach(func() {
@@ -405,8 +412,9 @@ var _ = Describe("Gateway", func() {
 
 	Context("Initialization", func() {
 		It("should wait for backend config", func() {
+			c.initializeAppFeatures()
 			gateway := &Handle{}
-			err := gateway.Setup(context.Background(), conf, logger.NOP, stats.NOP, c.mockApp, c.mockBackendConfig, c.mockJobsDB, c.mockErrJobsDB, nil, c.mockVersionHandler, rsources.NewNoOpService(), transformer.NewNoOpService(), sourcedebugger.NewNoOpService())
+			err := gateway.Setup(context.Background(), conf, logger.NOP, stats.NOP, c.mockApp, c.mockBackendConfig, c.mockJobsDB, c.mockErrJobsDB, nil, c.mockVersionHandler, rsources.NewNoOpService(), transformer.NewNoOpService(), sourcedebugger.NewNoOpService(), nil)
 			Expect(err).To(BeNil())
 			waitForBackendConfigInit(gateway)
 			err = gateway.Shutdown()
@@ -422,6 +430,7 @@ var _ = Describe("Gateway", func() {
 		)
 
 		BeforeEach(func() {
+			c.initializeAppFeatures()
 			whServer = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				w.WriteHeader(http.StatusOK)
 				_, _ = io.WriteString(w, "OK")
@@ -438,7 +447,7 @@ var _ = Describe("Gateway", func() {
 			GinkgoT().Setenv("RSERVER_GATEWAY_WEB_PORT", strconv.Itoa(serverPort))
 
 			gateway = &Handle{}
-			err = gateway.Setup(context.Background(), conf, logger.NOP, stats.NOP, c.mockApp, c.mockBackendConfig, c.mockJobsDB, c.mockErrJobsDB, nil, c.mockVersionHandler, rsources.NewNoOpService(), transformer.NewNoOpService(), sourcedebugger.NewNoOpService())
+			err = gateway.Setup(context.Background(), conf, logger.NOP, stats.NOP, c.mockApp, c.mockBackendConfig, c.mockJobsDB, c.mockErrJobsDB, nil, c.mockVersionHandler, rsources.NewNoOpService(), transformer.NewNoOpService(), sourcedebugger.NewNoOpService(), nil)
 			Expect(err).To(BeNil())
 			waitForBackendConfigInit(gateway)
 			gateway.irh = mockRequestHandler{}
@@ -478,7 +487,7 @@ var _ = Describe("Gateway", func() {
 				Expect(err).To(BeNil())
 				req.Header.Set("Content-Type", "application/json")
 				switch ep {
-				case "/internal/v1/replay", "/internal/v1/retl", "/internal/v1/batch":
+				case "/internal/v1/replay", "/internal/v1/retl":
 					req.Header.Set("X-Rudder-Source-Id", ReplaySourceID)
 				default:
 					req.Header.Set("Authorization", "Basic "+base64.StdEncoding.EncodeToString([]byte(WriteKeyEnabled+":")))
@@ -528,11 +537,12 @@ var _ = Describe("Gateway", func() {
 		)
 
 		BeforeEach(func() {
+			c.initializeAppFeatures()
 			statsStore, err = memstats.New()
 			Expect(err).To(BeNil())
 
 			gateway = &Handle{}
-			err := gateway.Setup(context.Background(), conf, logger.NOP, statsStore, c.mockApp, c.mockBackendConfig, c.mockJobsDB, c.mockErrJobsDB, nil, c.mockVersionHandler, rsources.NewNoOpService(), transformer.NewNoOpService(), sourcedebugger.NewNoOpService())
+			err := gateway.Setup(context.Background(), conf, logger.NOP, statsStore, c.mockApp, c.mockBackendConfig, c.mockJobsDB, c.mockErrJobsDB, nil, c.mockVersionHandler, rsources.NewNoOpService(), transformer.NewNoOpService(), sourcedebugger.NewNoOpService(), nil)
 			Expect(err).To(BeNil())
 			waitForBackendConfigInit(gateway)
 		})
@@ -593,6 +603,8 @@ var _ = Describe("Gateway", func() {
 			strippedPayload, _ := sjson.Delete(payload.String(), "messageId")
 			strippedPayload, _ = sjson.Delete(strippedPayload, "rudderId")
 			strippedPayload, _ = sjson.Delete(strippedPayload, "type")
+			strippedPayload, _ = sjson.Delete(strippedPayload, "receivedAt")
+			strippedPayload, _ = sjson.Delete(strippedPayload, "request_ip")
 
 			return strippedPayload
 		}
@@ -813,7 +825,7 @@ var _ = Describe("Gateway", func() {
 							"sdkVersion":  "",
 						},
 					)
-					return stat != nil && stat.LastValue() == float64(1)
+					return stat != nil && stat.LastValue() == float64(2)
 				},
 				1*time.Second,
 			).Should(BeTrue())
@@ -860,12 +872,13 @@ var _ = Describe("Gateway", func() {
 		)
 
 		BeforeEach(func() {
+			c.initializeAppFeatures()
 			statsStore, err = memstats.New()
 			Expect(err).To(BeNil())
 
 			gateway = &Handle{}
 
-			err := gateway.Setup(context.Background(), conf, logger.NOP, statsStore, c.mockApp, c.mockBackendConfig, c.mockJobsDB, c.mockErrJobsDB, c.mockRateLimiter, c.mockVersionHandler, rsources.NewNoOpService(), transformer.NewNoOpService(), sourcedebugger.NewNoOpService())
+			err := gateway.Setup(context.Background(), conf, logger.NOP, statsStore, c.mockApp, c.mockBackendConfig, c.mockJobsDB, c.mockErrJobsDB, c.mockRateLimiter, c.mockVersionHandler, rsources.NewNoOpService(), transformer.NewNoOpService(), sourcedebugger.NewNoOpService(), nil)
 			Expect(err).To(BeNil())
 			waitForBackendConfigInit(gateway)
 		})
@@ -966,12 +979,13 @@ var _ = Describe("Gateway", func() {
 		)
 
 		BeforeEach(func() {
+			c.initializeAppFeatures()
 			statsStore, err = memstats.New()
 			Expect(err).To(BeNil())
 
 			gateway = &Handle{}
 			conf.Set("Gateway.enableRateLimit", true)
-			err := gateway.Setup(context.Background(), conf, logger.NOP, statsStore, c.mockApp, c.mockBackendConfig, c.mockJobsDB, c.mockErrJobsDB, c.mockRateLimiter, c.mockVersionHandler, rsources.NewNoOpService(), transformer.NewNoOpService(), sourcedebugger.NewNoOpService())
+			err := gateway.Setup(context.Background(), conf, logger.NOP, statsStore, c.mockApp, c.mockBackendConfig, c.mockJobsDB, c.mockErrJobsDB, c.mockRateLimiter, c.mockVersionHandler, rsources.NewNoOpService(), transformer.NewNoOpService(), sourcedebugger.NewNoOpService(), nil)
 			Expect(err).To(BeNil())
 			waitForBackendConfigInit(gateway)
 		})
@@ -1060,11 +1074,12 @@ var _ = Describe("Gateway", func() {
 		)
 
 		BeforeEach(func() {
+			c.initializeAppFeatures()
 			statsStore, err = memstats.New()
 			Expect(err).To(BeNil())
 
 			gateway = &Handle{}
-			err := gateway.Setup(context.Background(), conf, logger.NOP, statsStore, c.mockApp, c.mockBackendConfig, c.mockJobsDB, c.mockErrJobsDB, nil, c.mockVersionHandler, rsources.NewNoOpService(), transformer.NewNoOpService(), sourcedebugger.NewNoOpService())
+			err := gateway.Setup(context.Background(), conf, logger.NOP, statsStore, c.mockApp, c.mockBackendConfig, c.mockJobsDB, c.mockErrJobsDB, nil, c.mockVersionHandler, rsources.NewNoOpService(), transformer.NewNoOpService(), sourcedebugger.NewNoOpService(), nil)
 			Expect(err).To(BeNil())
 			waitForBackendConfigInit(gateway)
 		})
@@ -1149,12 +1164,14 @@ var _ = Describe("Gateway", func() {
 		It("should reject requests without valid rudder event in request body", func() {
 			conf.Set("Gateway.allowReqsWithoutUserIDAndAnonymousID", true)
 			Eventually(func() bool { return gateway.conf.allowReqsWithoutUserIDAndAnonymousID.Load() }).Should(BeTrue())
+			batchCount := 0
 			for handlerType, handler := range allHandlers(gateway) {
 				reqType := handlerType
 				notRudderEvent := `[{"data": "valid-json","foo":"bar"}]`
 				if handlerType == "batch" || handlerType == "import" {
 					notRudderEvent = `{"batch": [[{"data": "valid-json","foo":"bar"}]]}`
 					reqType = "batch"
+					batchCount++
 				}
 				expectHandlerResponse(
 					handler,
@@ -1181,19 +1198,27 @@ var _ = Describe("Gateway", func() {
 								"sdkVersion":  "",
 							},
 						)
-						return stat != nil && stat.LastValue() == float64(1)
+						// multiple `handlerType` are mapped to batch `reqType`
+						count := 1
+						if reqType == "batch" {
+							count = batchCount
+						}
+
+						return stat != nil && stat.LastValue() == float64(count)
 					},
 				).Should(BeTrue())
 			}
 		})
 
 		It("should reject requests with both userId and anonymousId not present", func() {
+			batchCount := 0
 			for handlerType, handler := range allHandlers(gateway) {
 				reqType := handlerType
 				validBody := `{"data": "valid-json"}`
 				if handlerType == "batch" || handlerType == "import" {
 					validBody = `{"batch": [{"data": "valid-json"}]}`
 					reqType = "batch"
+					batchCount++
 				}
 				if handlerType != "extract" {
 					expectHandlerResponse(
@@ -1221,7 +1246,12 @@ var _ = Describe("Gateway", func() {
 									"sdkVersion":  "",
 								},
 							)
-							return stat != nil && stat.LastValue() == float64(1)
+							// multiple `handlerType` are mapped to batch `reqType`
+							count := 1
+							if reqType == "batch" {
+								count = batchCount
+							}
+							return stat != nil && stat.LastValue() == float64(count)
 						},
 					).Should(BeTrue())
 				}
@@ -1343,8 +1373,9 @@ var _ = Describe("Gateway", func() {
 		var gateway *Handle
 
 		BeforeEach(func() {
+			c.initializeAppFeatures()
 			gateway = &Handle{}
-			err := gateway.Setup(context.Background(), conf, logger.NOP, stats.NOP, c.mockApp, c.mockBackendConfig, c.mockJobsDB, c.mockErrJobsDB, nil, c.mockVersionHandler, rsources.NewNoOpService(), transformer.NewNoOpService(), sourcedebugger.NewNoOpService())
+			err := gateway.Setup(context.Background(), conf, logger.NOP, stats.NOP, c.mockApp, c.mockBackendConfig, c.mockJobsDB, c.mockErrJobsDB, nil, c.mockVersionHandler, rsources.NewNoOpService(), transformer.NewNoOpService(), sourcedebugger.NewNoOpService(), nil)
 			Expect(err).To(BeNil())
 			waitForBackendConfigInit(gateway)
 		})
@@ -1369,8 +1400,9 @@ var _ = Describe("Gateway", func() {
 			userIDHeader = "userIDHeader"
 		)
 		BeforeEach(func() {
+			c.initializeAppFeatures()
 			gateway = &Handle{}
-			err := gateway.Setup(context.Background(), conf, logger.NOP, stats.NOP, c.mockApp, c.mockBackendConfig, c.mockJobsDB, c.mockErrJobsDB, nil, c.mockVersionHandler, rsources.NewNoOpService(), transformer.NewNoOpService(), sourcedebugger.NewNoOpService())
+			err := gateway.Setup(context.Background(), conf, logger.NOP, stats.NOP, c.mockApp, c.mockBackendConfig, c.mockJobsDB, c.mockErrJobsDB, nil, c.mockVersionHandler, rsources.NewNoOpService(), transformer.NewNoOpService(), sourcedebugger.NewNoOpService(), nil)
 			Expect(err).To(BeNil())
 			waitForBackendConfigInit(gateway)
 		})
@@ -1522,6 +1554,53 @@ var _ = Describe("Gateway", func() {
 			Expect(job.Batch[0].MessageID).To(Equal("-a-random-string"))
 		})
 
+		It("doesn't override if receivedAt or request_ip already exists in payload", func() {
+			req := &webRequestT{
+				reqType:        "batch",
+				authContext:    rCtxEnabled,
+				done:           make(chan<- string),
+				userIDHeader:   userIDHeader,
+				requestPayload: []byte(`{"batch": [{"type": "extract", "receivedAt": "2024-01-01T01:01:01.000000001Z", "request_ip": "dummyIPFromPayload"}]}`),
+			}
+			jobForm, err := gateway.getJobDataFromRequest(req)
+			Expect(err).To(BeNil())
+
+			var job struct {
+				Batch []struct {
+					ReceivedAt string `json:"receivedAt"`
+					RequestIP  string `json:"request_ip"`
+				} `json:"batch"`
+			}
+			err = json.Unmarshal(jobForm.jobs[0].EventPayload, &job)
+			Expect(err).To(BeNil())
+			Expect(job.Batch[0].ReceivedAt).To(ContainSubstring("2024-01-01T01:01:01.000000001Z"))
+			Expect(job.Batch[0].RequestIP).To(ContainSubstring("dummyIPFromPayload"))
+		})
+
+		It("adds receivedAt and request_ip in the request payload if it's not already present", func() {
+			req := &webRequestT{
+				reqType:        "batch",
+				authContext:    rCtxEnabled,
+				done:           make(chan<- string),
+				userIDHeader:   userIDHeader,
+				requestPayload: []byte(`{"batch": [{"type": "extract"}]}`),
+			}
+			req.ipAddr = "dummyIP"
+			jobForm, err := gateway.getJobDataFromRequest(req)
+			Expect(err).To(BeNil())
+
+			var job struct {
+				Batch []struct {
+					ReceivedAt string `json:"receivedAt"`
+					RequestIP  string `json:"request_ip"`
+				} `json:"batch"`
+			}
+			err = json.Unmarshal(jobForm.jobs[0].EventPayload, &job)
+			Expect(err).To(BeNil())
+			Expect(job.Batch[0].ReceivedAt).To(Not(BeEmpty()))
+			Expect(job.Batch[0].RequestIP).To(ContainSubstring("dummyIP"))
+		})
+
 		It("allows extract events even if userID and anonID are not present in the request payload", func() {
 			req := &webRequestT{
 				reqType:        "batch",
@@ -1550,8 +1629,9 @@ var _ = Describe("Gateway", func() {
 	Context("SaveWebhookFailures", func() {
 		var gateway *Handle
 		BeforeEach(func() {
+			c.initializeAppFeatures()
 			gateway = &Handle{}
-			err := gateway.Setup(context.Background(), conf, logger.NOP, stats.NOP, c.mockApp, c.mockBackendConfig, c.mockJobsDB, c.mockErrJobsDB, nil, c.mockVersionHandler, rsources.NewNoOpService(), transformer.NewNoOpService(), sourcedebugger.NewNoOpService())
+			err := gateway.Setup(context.Background(), conf, logger.NOP, stats.NOP, c.mockApp, c.mockBackendConfig, c.mockJobsDB, c.mockErrJobsDB, nil, c.mockVersionHandler, rsources.NewNoOpService(), transformer.NewNoOpService(), sourcedebugger.NewNoOpService(), nil)
 			Expect(err).To(BeNil())
 			waitForBackendConfigInit(gateway)
 		})
@@ -1612,6 +1692,323 @@ var _ = Describe("Gateway", func() {
 			}
 			err := gateway.SaveWebhookFailures(reqs)
 			Expect(err).To(BeNil())
+		})
+	})
+
+	Context("Internal Batch", func() {
+		client := http.Client{}
+		var (
+			gateway               *Handle
+			internalBatchEndpoint string
+			ctx                   context.Context
+			cancel                func()
+			wait                  chan struct{}
+			srcDebugger           *mocksrcdebugger.MockSourceDebugger
+		)
+
+		createInternalBatchPayload := func(userID, sourceID string) []byte {
+			validData := fmt.Sprintf(
+				`{"userId":%q,"data":{"string":"valid-json","nested":{"child":1}},%s}`,
+				userID, sdkContext,
+			)
+			internalBatchPayload := fmt.Sprintf(`[{
+			"properties": {
+				"messageID": "messageID",
+				"routingKey": "anonymousId_header<<>>anonymousId_1<<>>identified_user_id",
+				"workspaceID": %q,
+				"userID": %q,
+				"sourceID": %q,
+				"sourceJobRunID": "sourceJobRunID",
+				"sourceTaskRunID": "sourceTaskRunID",
+				"receivedAt": "2024-01-01T01:01:01.000000001Z",
+				"requestIP": "1.1.1.1",
+				"traceID": "traceID"
+			},
+			"payload": %s
+			}]`, WorkspaceID, userID, sourceID, validData)
+			return []byte(internalBatchPayload)
+		}
+
+		createInternalBatchPayloadWithMultipleEvents := func(userID, sourceID, workspaceID string) []byte {
+			validData := fmt.Sprintf(
+				`{"userId":%q,"data":{"string":"valid-json","nested":{"child":1}},%s}`,
+				userID, sdkContext,
+			)
+			internalBatchPayload := func() string {
+				return fmt.Sprintf(`{
+			"properties": {
+				"messageID": %q,
+				"routingKey": "anonymousId_header<<>>anonymousId_1<<>>identified_user_id",
+				"workspaceID": %q,
+				"userID": %q,
+				"sourceID": %q,
+				"sourceJobRunID": "sourceJobRunID",
+				"sourceTaskRunID": "sourceTaskRunID",
+				"receivedAt": "2024-01-01T01:01:01.000000001Z",
+				"requestIP": "1.1.1.1",
+				"traceID": "traceID"
+			},
+			"payload": %s
+			}`, uuid.NewString(), workspaceID, userID, sourceID, validData)
+			}
+			return []byte(fmt.Sprintf(`[%s,%s]`, internalBatchPayload(), internalBatchPayload()))
+		}
+
+		// a second after receivedAt
+		now, err := time.Parse(time.RFC3339Nano, "2024-01-01T01:01:02.000000001Z")
+		Expect(err).To(BeNil())
+
+		statStore, err := memstats.New(
+			memstats.WithNow(func() time.Time {
+				return now
+			}),
+		)
+		Expect(err).To(BeNil())
+
+		BeforeEach(func() {
+			c.mockSuppressUser = mocksTypes.NewMockUserSuppression(c.mockCtrl)
+			c.mockSuppressUserFeature = mocksApp.NewMockSuppressUserFeature(c.mockCtrl)
+			c.initializeEnterpriseAppFeatures()
+
+			c.mockSuppressUserFeature.EXPECT().Setup(gomock.Any(), gomock.Any()).AnyTimes().Return(c.mockSuppressUser, nil)
+			c.mockSuppressUser.EXPECT().GetSuppressedUser(WorkspaceID, NormalUserID, SourceIDEnabled).Return(nil).AnyTimes()
+			c.mockSuppressUser.EXPECT().GetSuppressedUser(WorkspaceID, SuppressedUserID, SourceIDEnabled).Return(&model.Metadata{
+				CreatedAt: time.Now(),
+			}).AnyTimes()
+			c.mockSuppressUser.EXPECT().GetSuppressedUser(WorkspaceID, NormalUserID, writeKeyNotPresentInSource).Return(nil).AnyTimes()
+
+			conf = config.New()
+			conf.Set("Gateway.enableRateLimit", false)
+			conf.Set("Gateway.enableSuppressUserFeature", true)
+			conf.Set("Gateway.enableEventSchemasFeature", false)
+
+			serverPort, err := kithelper.GetFreePort()
+			Expect(err).To(BeNil())
+			internalBatchEndpoint = fmt.Sprintf("http://localhost:%d/internal/v1/batch", serverPort)
+			GinkgoT().Setenv("RSERVER_GATEWAY_WEB_PORT", strconv.Itoa(serverPort))
+
+			gateway = &Handle{}
+			srcDebugger = mocksrcdebugger.NewMockSourceDebugger(c.mockCtrl)
+			err = gateway.Setup(context.Background(), conf, logger.NOP, statStore, c.mockApp, c.mockBackendConfig, c.mockJobsDB, c.mockErrJobsDB, nil, c.mockVersionHandler, rsources.NewNoOpService(), transformer.NewNoOpService(), srcDebugger, nil)
+			Expect(err).To(BeNil())
+			waitForBackendConfigInit(gateway)
+			c.mockBackendConfig.EXPECT().WaitForConfig(gomock.Any()).AnyTimes()
+			ctx, cancel = context.WithCancel(context.Background())
+			wait = make(chan struct{})
+			go func() {
+				err = gateway.StartWebHandler(ctx)
+				Expect(err).To(BeNil())
+				close(wait)
+			}()
+			Eventually(func() bool {
+				resp, err := http.Get(fmt.Sprintf("http://localhost:%d/version", serverPort))
+				if err != nil {
+					return false
+				}
+				return resp.StatusCode == http.StatusOK
+			}, time.Second*10, time.Second).Should(BeTrue())
+		})
+
+		AfterEach(func() {
+			cancel()
+			<-wait
+			c.Finish()
+			err := gateway.Shutdown()
+			Expect(err).To(BeNil())
+		})
+
+		It("Successful request, with debugger", func() {
+			srcDebugger.EXPECT().RecordEvent(WriteKeyEnabled, gomock.Any()).Times(1)
+			c.mockJobsDB.EXPECT().WithStoreSafeTx(gomock.Any(), gomock.Any()).Times(1)
+			payload := createInternalBatchPayload(NormalUserID, SourceIDEnabled)
+			req, err := http.NewRequest(http.MethodPost, internalBatchEndpoint, bytes.NewBuffer(payload))
+			Expect(err).To(BeNil())
+			resp, err := client.Do(req)
+			Expect(err).To(BeNil())
+			Expect(http.StatusOK, resp.StatusCode)
+
+			Expect(statStore.GetByName("gateway.event_pickup_lag_seconds")).To(Equal([]memstats.Metric{
+				{
+					Name: "gateway.event_pickup_lag_seconds",
+					Tags: map[string]string{"sourceId": SourceIDEnabled, "workspaceId": WorkspaceID},
+					Durations: []time.Duration{
+						time.Second,
+					},
+				},
+			}))
+		})
+
+		It("Successful request, without debugger", func() {
+			c.mockJobsDB.EXPECT().WithStoreSafeTx(gomock.Any(), gomock.Any()).Times(1)
+			payload := createInternalBatchPayload(NormalUserID, writeKeyNotPresentInSource)
+			req, err := http.NewRequest(http.MethodPost, internalBatchEndpoint, bytes.NewBuffer(payload))
+			Expect(err).To(BeNil())
+			resp, err := client.Do(req)
+			Expect(err).To(BeNil())
+			Expect(http.StatusOK, resp.StatusCode)
+		})
+
+		It("request failed 0 messages", func() {
+			req, err := http.NewRequest(http.MethodPost, internalBatchEndpoint, bytes.NewBuffer([]byte(`[]`)))
+			Expect(err).To(BeNil())
+			resp, err := client.Do(req)
+			Expect(err).To(BeNil())
+			Expect(http.StatusOK, resp.StatusCode)
+			respData, err := io.ReadAll(resp.Body)
+			defer httputil.CloseResponse(resp)
+			Expect(err).To(BeNil())
+			Expect(string(respData)).Should(ContainSubstring(response.NotRudderEvent))
+		})
+
+		It("request failed unmarshall error", func() {
+			req, err := http.NewRequest(http.MethodPost, internalBatchEndpoint, bytes.NewBuffer([]byte(`[`)))
+			Expect(err).To(BeNil())
+			resp, err := client.Do(req)
+			Expect(err).To(BeNil())
+			Expect(http.StatusBadRequest, resp.StatusCode)
+			respData, err := io.ReadAll(resp.Body)
+			defer httputil.CloseResponse(resp)
+			Expect(err).To(BeNil())
+			Expect(string(respData)).Should(ContainSubstring(response.InvalidJSON))
+		})
+
+		It("request failed message validation error", func() {
+			req, err := http.NewRequest(http.MethodPost, internalBatchEndpoint, bytes.NewBuffer([]byte(`[{}]`)))
+			Expect(err).To(BeNil())
+			resp, err := client.Do(req)
+			Expect(err).To(BeNil())
+			Expect(http.StatusBadRequest, resp.StatusCode)
+			respData, err := io.ReadAll(resp.Body)
+			defer httputil.CloseResponse(resp)
+			Expect(err).To(BeNil())
+			Expect(string(respData)).Should(ContainSubstring(response.InvalidStreamMessage))
+		})
+
+		It("request success - suppressed user", func() {
+			payload := createInternalBatchPayload(SuppressedUserID, SourceIDEnabled)
+			req, err := http.NewRequest(http.MethodPost, internalBatchEndpoint, bytes.NewBuffer(payload))
+			Expect(err).To(BeNil())
+			resp, err := client.Do(req)
+			Expect(err).To(BeNil())
+			Expect(http.StatusOK, resp.StatusCode)
+		})
+
+		It("request success - multiple messages", func() {
+			srcDebugger.EXPECT().RecordEvent(WriteKeyEnabled, gomock.Any()).Times(2)
+			c.mockJobsDB.EXPECT().WithStoreSafeTx(gomock.Any(), gomock.Any()).Times(1)
+			payload := createInternalBatchPayloadWithMultipleEvents(NormalUserID, SourceIDEnabled, WorkspaceID)
+			req, err := http.NewRequest(http.MethodPost, internalBatchEndpoint, bytes.NewBuffer(payload))
+			Expect(err).To(BeNil())
+			resp, err := client.Do(req)
+			Expect(err).To(BeNil())
+			Expect(http.StatusOK, resp.StatusCode)
+		})
+
+		It("request failed db error", func() {
+			c.mockJobsDB.EXPECT().WithStoreSafeTx(gomock.Any(), gomock.Any()).Times(1).Return(fmt.Errorf("db error"))
+			payload := createInternalBatchPayload(NormalUserID, SourceIDEnabled)
+			req, err := http.NewRequest(http.MethodPost, internalBatchEndpoint, bytes.NewBuffer(payload))
+			Expect(err).To(BeNil())
+			resp, err := client.Do(req)
+			Expect(err).To(BeNil())
+			Expect(http.StatusInternalServerError, resp.StatusCode)
+		})
+	})
+
+	Context("extractJobsFromInternalBatchPayload", func() {
+		var gateway *Handle
+		BeforeEach(func() {
+			c.initializeAppFeatures()
+			gateway = &Handle{}
+			err := gateway.Setup(context.Background(), conf, logger.NOP, stats.NOP, c.mockApp, c.mockBackendConfig, c.mockJobsDB, c.mockErrJobsDB, nil, c.mockVersionHandler, rsources.NewNoOpService(), transformer.NewNoOpService(), sourcedebugger.NewNoOpService(), nil)
+			Expect(err).To(BeNil())
+			waitForBackendConfigInit(gateway)
+		})
+
+		AfterEach(func() {
+			err := gateway.Shutdown()
+			Expect(err).To(BeNil())
+		})
+
+		It("doesn't override if receivedAt or request_ip already exists in payload", func() {
+			properties := stream.MessageProperties{
+				MessageID:     "messageID",
+				RoutingKey:    "anonymousId_header<<>>anonymousId_1<<>>identified_user_id",
+				WorkspaceID:   "workspaceID",
+				SourceID:      "sourceID",
+				ReceivedAt:    time.Date(2024, 1, 1, 1, 1, 1, 1, time.UTC),
+				RequestIP:     "dummyIP",
+				DestinationID: "destinationID",
+			}
+			msg := stream.Message{
+				Properties: properties,
+				Payload:    []byte(`{"receivedAt": "dummyReceivedAtFromPayload", "request_ip": "dummyIPFromPayload"}`),
+			}
+			messages := []stream.Message{msg}
+			payload, err := json.Marshal(messages)
+			Expect(err).To(BeNil())
+
+			req := &webRequestT{
+				reqType:        "batch",
+				authContext:    rCtxEnabled,
+				done:           make(chan<- string),
+				requestPayload: payload,
+			}
+			jobForm, err := gateway.extractJobsFromInternalBatchPayload("batch", req.requestPayload)
+			Expect(err).To(BeNil())
+
+			var job struct {
+				Batch []struct {
+					ReceivedAt string `json:"receivedAt"`
+					RequestIP  string `json:"request_ip"`
+				} `json:"batch"`
+			}
+			Expect(jobForm).To(HaveLen(1))
+			err = json.Unmarshal(jobForm[0].EventPayload, &job)
+			Expect(err).To(BeNil())
+			Expect(job.Batch).To(HaveLen(1))
+			Expect(job.Batch[0].ReceivedAt).To(ContainSubstring("dummyReceivedAtFromPayload"))
+			Expect(job.Batch[0].RequestIP).To(ContainSubstring("dummyIPFromPayload"))
+		})
+
+		It("adds receivedAt and request_ip in the request payload if it's not already present", func() {
+			properties := stream.MessageProperties{
+				MessageID:     "messageID",
+				RoutingKey:    "anonymousId_header<<>>anonymousId_1<<>>identified_user_id",
+				WorkspaceID:   "workspaceID",
+				SourceID:      "sourceID",
+				ReceivedAt:    time.Date(2024, 1, 1, 1, 1, 1, 1, time.UTC),
+				RequestIP:     "dummyIP",
+				DestinationID: "destinationID",
+			}
+			msg := stream.Message{
+				Properties: properties,
+				Payload:    []byte(`{}`),
+			}
+			messages := []stream.Message{msg}
+			payload, err := json.Marshal(messages)
+			Expect(err).To(BeNil())
+			req := &webRequestT{
+				reqType:        "batch",
+				authContext:    rCtxEnabled,
+				done:           make(chan<- string),
+				requestPayload: payload,
+			}
+			jobForm, err := gateway.extractJobsFromInternalBatchPayload("batch", req.requestPayload)
+			Expect(err).To(BeNil())
+
+			var job struct {
+				Batch []struct {
+					ReceivedAt string `json:"receivedAt"`
+					RequestIP  string `json:"request_ip"`
+				} `json:"batch"`
+			}
+			Expect(jobForm).To(HaveLen(1))
+			err = json.Unmarshal(jobForm[0].EventPayload, &job)
+			Expect(err).To(BeNil())
+			Expect(job.Batch).To(HaveLen(1))
+			Expect(job.Batch[0].ReceivedAt).To(ContainSubstring("2024-01-01T01:01:01.000Z"))
+			Expect(job.Batch[0].RequestIP).To(ContainSubstring("dummyIP"))
 		})
 	})
 })
@@ -1709,7 +2106,7 @@ func endpointsToVerify() ([]string, []string, []string) {
 		"/v1/warehouse/pending-events",
 		"/v1/warehouse/trigger-upload",
 		"/v1/warehouse/jobs",
-		"/internal/v1/batch",
+		// "/internal/v1/batch", will be tested in new unit test
 	}
 
 	deleteEndpoints := []string{

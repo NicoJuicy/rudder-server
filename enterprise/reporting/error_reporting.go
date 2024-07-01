@@ -22,9 +22,9 @@ import (
 	"github.com/rudderlabs/rudder-go-kit/config"
 	"github.com/rudderlabs/rudder-go-kit/logger"
 	"github.com/rudderlabs/rudder-go-kit/stats"
+
 	migrator "github.com/rudderlabs/rudder-server/services/sql-migrator"
 	"github.com/rudderlabs/rudder-server/utils/httputil"
-	"github.com/rudderlabs/rudder-server/utils/misc"
 	. "github.com/rudderlabs/rudder-server/utils/tx" //nolint:staticcheck
 	"github.com/rudderlabs/rudder-server/utils/types"
 )
@@ -65,9 +65,9 @@ type ErrorDetailReporter struct {
 
 	instanceID            string
 	region                string
-	sleepInterval         misc.ValueLoader[time.Duration]
-	mainLoopSleepInterval misc.ValueLoader[time.Duration]
-	maxConcurrentRequests misc.ValueLoader[int]
+	sleepInterval         config.ValueLoader[time.Duration]
+	mainLoopSleepInterval config.ValueLoader[time.Duration]
+	maxConcurrentRequests config.ValueLoader[int]
 	maxOpenConnections    int
 
 	httpClient *http.Client
@@ -540,15 +540,17 @@ func (edr *ErrorDetailReporter) aggregate(reports []*types.EDReportsDB) []*types
 				irep.ErrorMessage < jrep.ErrorMessage ||
 				irep.EventType < jrep.EventType)
 		})
-		errs := lo.MapToSlice(reportsCountMap, func(rep types.EDErrorDetails, count int64) types.EDErrorDetails {
-			return types.EDErrorDetails{
-				StatusCode:   rep.StatusCode,
-				ErrorCode:    rep.ErrorCode,
-				ErrorMessage: rep.ErrorMessage,
-				EventType:    rep.EventType,
-				Count:        count,
+		errs := make([]types.EDErrorDetails, len(reportGrpKeys))
+		for i, repKey := range reportGrpKeys {
+			repCount := reportsCountMap[repKey]
+			errs[i] = types.EDErrorDetails{
+				StatusCode:   repKey.StatusCode,
+				ErrorCode:    repKey.ErrorCode,
+				ErrorMessage: repKey.ErrorMessage,
+				EventType:    repKey.EventType,
+				Count:        repCount,
 			}
-		})
+		}
 		edrSchema.Errors = errs
 		edrortingMetrics = append(edrortingMetrics, &edrSchema)
 	}

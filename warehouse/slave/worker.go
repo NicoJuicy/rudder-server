@@ -3,7 +3,6 @@ package slave
 import (
 	"bufio"
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -11,11 +10,11 @@ import (
 	"strconv"
 	"time"
 
+	jsoniter "github.com/json-iterator/go"
+
 	"github.com/rudderlabs/rudder-server/warehouse/bcm"
 	"github.com/rudderlabs/rudder-server/warehouse/constraints"
 	"github.com/rudderlabs/rudder-server/warehouse/utils/types"
-
-	"github.com/rudderlabs/rudder-server/utils/misc"
 
 	"github.com/rudderlabs/rudder-server/services/notifier"
 
@@ -23,6 +22,7 @@ import (
 
 	"github.com/rudderlabs/rudder-go-kit/config"
 	"github.com/rudderlabs/rudder-go-kit/stats"
+
 	"github.com/rudderlabs/rudder-server/warehouse/encoding"
 	integrationsconfig "github.com/rudderlabs/rudder-server/warehouse/integrations/config"
 	"github.com/rudderlabs/rudder-server/warehouse/integrations/manager"
@@ -34,6 +34,7 @@ import (
 var (
 	errIncompatibleSchemaConversion = errors.New("incompatible schema conversion")
 	errSchemaConversionNotSupported = errors.New("schema conversion not supported")
+	json                            = jsoniter.ConfigCompatibleWithStandardLibrary
 )
 
 type uploadProcessingResult struct {
@@ -62,7 +63,7 @@ type worker struct {
 	workerIdx          int
 
 	config struct {
-		maxStagingFileReadBufferCapacityInK misc.ValueLoader[int]
+		maxStagingFileReadBufferCapacityInK config.ValueLoader[int]
 	}
 	stats struct {
 		workerIdleTime                 stats.Measurement

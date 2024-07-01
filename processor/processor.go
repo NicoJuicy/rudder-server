@@ -14,6 +14,8 @@ import (
 
 	"golang.org/x/sync/errgroup"
 
+	"github.com/rudderlabs/rudder-go-kit/stringify"
+
 	jsoniter "github.com/json-iterator/go"
 	"github.com/samber/lo"
 	"github.com/tidwall/gjson"
@@ -25,6 +27,7 @@ import (
 	"github.com/rudderlabs/rudder-go-kit/stats"
 	"github.com/rudderlabs/rudder-go-kit/stats/metric"
 	kitsync "github.com/rudderlabs/rudder-go-kit/sync"
+
 	backendconfig "github.com/rudderlabs/rudder-server/backend-config"
 	"github.com/rudderlabs/rudder-server/internal/enricher"
 	"github.com/rudderlabs/rudder-server/jobsdb"
@@ -92,10 +95,10 @@ type Handle struct {
 	backgroundCancel           context.CancelFunc
 	statsFactory               stats.Stats
 	stats                      processorStats
-	payloadLimit               misc.ValueLoader[int64]
-	jobsDBCommandTimeout       misc.ValueLoader[time.Duration]
-	jobdDBQueryRequestTimeout  misc.ValueLoader[time.Duration]
-	jobdDBMaxRetries           misc.ValueLoader[int]
+	payloadLimit               config.ValueLoader[int64]
+	jobsDBCommandTimeout       config.ValueLoader[time.Duration]
+	jobdDBQueryRequestTimeout  config.ValueLoader[time.Duration]
+	jobdDBMaxRetries           config.ValueLoader[int]
 	transientSources           transientsource.Service
 	fileuploader               fileuploader.Provider
 	rsourcesService            rsources.JobService
@@ -115,13 +118,13 @@ type Handle struct {
 		enablePipelining                bool
 		pipelineBufferedItems           int
 		subJobSize                      int
-		pingerSleep                     misc.ValueLoader[time.Duration]
-		readLoopSleep                   misc.ValueLoader[time.Duration]
-		maxLoopSleep                    misc.ValueLoader[time.Duration]
-		storeTimeout                    misc.ValueLoader[time.Duration]
-		maxEventsToProcess              misc.ValueLoader[int]
-		transformBatchSize              misc.ValueLoader[int]
-		userTransformBatchSize          misc.ValueLoader[int]
+		pingerSleep                     config.ValueLoader[time.Duration]
+		readLoopSleep                   config.ValueLoader[time.Duration]
+		maxLoopSleep                    config.ValueLoader[time.Duration]
+		storeTimeout                    config.ValueLoader[time.Duration]
+		maxEventsToProcess              config.ValueLoader[int]
+		transformBatchSize              config.ValueLoader[int]
+		userTransformBatchSize          config.ValueLoader[int]
 		sourceIdDestinationMap          map[string][]backendconfig.DestinationT
 		sourceIdSourceMap               map[string]backendconfig.SourceT
 		workspaceLibrariesMap           map[string]backendconfig.LibrariesT
@@ -131,21 +134,25 @@ type Handle struct {
 		batchDestinations               []string
 		configSubscriberLock            sync.RWMutex
 		enableDedup                     bool
-		enableEventCount                misc.ValueLoader[bool]
+		enableEventCount                config.ValueLoader[bool]
 		transformTimesPQLength          int
-		captureEventNameStats           misc.ValueLoader[bool]
+		captureEventNameStats           config.ValueLoader[bool]
 		transformerURL                  string
 		pollInterval                    time.Duration
 		GWCustomVal                     string
 		asyncInit                       *misc.AsyncInit
 		eventSchemaV2Enabled            bool
-		archivalEnabled                 misc.ValueLoader[bool]
+		archivalEnabled                 config.ValueLoader[bool]
 		eventAuditEnabled               map[string]bool
+		credentialsMap                  map[string][]transformer.Credential
 	}
 
 	drainConfig struct {
-		jobRunIDs misc.ValueLoader[[]string]
+		jobRunIDs config.ValueLoader[[]string]
 	}
+
+	namespace  string
+	instanceID string
 
 	adaptiveLimit func(int64) int64
 	storePlocker  kitsync.PartitionLocker
@@ -393,8 +400,13 @@ func (proc *Handle) Setup(
 	}
 	proc.storePlocker = *kitsync.NewPartitionLocker()
 
+	proc.namespace = config.GetKubeNamespace()
+	proc.instanceID = misc.GetInstanceID()
+
 	// Stats
-	proc.statsFactory = stats.Default
+	if proc.statsFactory == nil {
+		proc.statsFactory = stats.Default
+	}
 	proc.tracer = proc.statsFactory.NewTracer("processor")
 	proc.stats.statGatewayDBR = func(partition string) stats.Measurement {
 		return proc.statsFactory.NewTaggedStat("processor_gateway_db_read", stats.CountType, stats.Tags{
@@ -794,6 +806,7 @@ func (proc *Handle) backendConfigSubscriber(ctx context.Context) {
 			sourceIdDestinationMap          = make(map[string][]backendconfig.DestinationT)
 			sourceIdSourceMap               = map[string]backendconfig.SourceT{}
 			eventAuditEnabled               = make(map[string]bool)
+			credentialsMap                  = make(map[string][]transformer.Credential)
 		)
 		for workspaceID, wConfig := range config {
 			for i := range wConfig.Sources {
@@ -816,6 +829,14 @@ func (proc *Handle) backendConfigSubscriber(ctx context.Context) {
 			}
 			workspaceLibrariesMap[workspaceID] = wConfig.Libraries
 			eventAuditEnabled[workspaceID] = wConfig.Settings.EventAuditEnabled
+			credentialsMap[workspaceID] = lo.MapToSlice(wConfig.Credentials, func(key string, value backendconfig.Credential) transformer.Credential {
+				return transformer.Credential{
+					ID:       key,
+					Key:      value.Key,
+					Value:    value.Value,
+					IsSecret: value.IsSecret,
+				}
+			})
 		}
 		proc.config.configSubscriberLock.Lock()
 		proc.config.oneTrustConsentCategoriesMap = oneTrustConsentCategoriesMap
@@ -825,6 +846,7 @@ func (proc *Handle) backendConfigSubscriber(ctx context.Context) {
 		proc.config.sourceIdDestinationMap = sourceIdDestinationMap
 		proc.config.sourceIdSourceMap = sourceIdSourceMap
 		proc.config.eventAuditEnabled = eventAuditEnabled
+		proc.config.credentialsMap = credentialsMap
 		proc.config.configSubscriberLock.Unlock()
 		if !initDone {
 			initDone = true
@@ -877,19 +899,19 @@ func (proc *Handle) getBackendEnabledDestinationTypes(sourceId string) map[strin
 	return enabledDestinationTypes
 }
 
-func getTimestampFromEvent(event types.SingularEventT, field string) time.Time {
+func getTimestampFromEvent(event types.SingularEventT, field string, defaultTimestamp time.Time) time.Time {
 	var timestamp time.Time
 	var ok bool
 	if timestamp, ok = misc.GetParsedTimestamp(event[field]); !ok {
-		timestamp = time.Now()
+		timestamp = defaultTimestamp
 	}
 	return timestamp
 }
 
-func enhanceWithTimeFields(event *transformer.TransformerEvent, singularEventMap types.SingularEventT, receivedAt time.Time) {
+func enhanceWithTimeFields(event *transformer.TransformerEvent, singularEvent types.SingularEventT, receivedAt time.Time) {
 	// set timestamp skew based on timestamp fields from SDKs
-	originalTimestamp := getTimestampFromEvent(singularEventMap, "originalTimestamp")
-	sentAt := getTimestampFromEvent(singularEventMap, "sentAt")
+	originalTimestamp := getTimestampFromEvent(singularEvent, "originalTimestamp", receivedAt)
+	sentAt := getTimestampFromEvent(singularEvent, "sentAt", receivedAt)
 	var timestamp time.Time
 	var ok bool
 
@@ -907,16 +929,16 @@ func enhanceWithTimeFields(event *transformer.TransformerEvent, singularEventMap
 	event.Message["timestamp"] = timestamp.Format(misc.RFC3339Milli)
 }
 
-func makeCommonMetadataFromSingularEvent(singularEvent types.SingularEventT, batchEvent *jobsdb.JobT, receivedAt time.Time, source *backendconfig.SourceT, eventParams types.EventParams) *transformer.Metadata {
+func (proc *Handle) makeCommonMetadataFromSingularEvent(singularEvent types.SingularEventT, batchEvent *jobsdb.JobT, receivedAt time.Time, source *backendconfig.SourceT, eventParams types.EventParams) *transformer.Metadata {
 	commonMetadata := transformer.Metadata{}
 	commonMetadata.SourceID = source.ID
 	commonMetadata.SourceName = source.Name
 	commonMetadata.WorkspaceID = source.WorkspaceID
-	commonMetadata.Namespace = config.GetKubeNamespace()
-	commonMetadata.InstanceID = misc.GetInstanceID()
+	commonMetadata.Namespace = proc.namespace
+	commonMetadata.InstanceID = proc.instanceID
 	commonMetadata.RudderID = batchEvent.UserID
 	commonMetadata.JobID = batchEvent.JobID
-	commonMetadata.MessageID = misc.GetStringifiedData(singularEvent["messageId"])
+	commonMetadata.MessageID = stringify.Any(singularEvent["messageId"])
 	commonMetadata.ReceivedAt = receivedAt.Format(misc.RFC3339Milli)
 	commonMetadata.SourceType = source.SourceDefinition.Name
 	commonMetadata.SourceCategory = source.SourceDefinition.Category
@@ -958,6 +980,7 @@ func enhanceWithMetadata(commonMetadata *transformer.Metadata, event *transforme
 	metadata.EventType = commonMetadata.EventType
 	metadata.SourceDefinitionID = commonMetadata.SourceDefinitionID
 	metadata.DestinationID = destination.ID
+	metadata.DestinationName = destination.Name
 	metadata.DestinationDefinitionID = destination.DestinationDefinition.ID
 	metadata.DestinationType = destination.DestinationDefinition.Name
 	metadata.SourceDefinitionType = commonMetadata.SourceDefinitionType
@@ -1007,8 +1030,8 @@ func (proc *Handle) recordEventDeliveryStatus(jobsByDestID map[string][]*jobsdb.
 					continue
 				}
 
-				eventName := misc.GetStringifiedData(gjson.GetBytes(eventPayload, "event").String())
-				eventType := misc.GetStringifiedData(gjson.GetBytes(eventPayload, "type").String())
+				eventName := stringify.Any(gjson.GetBytes(eventPayload, "event").String())
+				eventType := stringify.Any(gjson.GetBytes(eventPayload, "type").String())
 				deliveryStatus := destinationdebugger.DeliveryStatusT{
 					EventName:     eventName,
 					EventType:     eventType,
@@ -1094,6 +1117,7 @@ func (proc *Handle) getTransformerEvents(
 			Message:     userTransformedEvent.Output,
 			Metadata:    *eventMetadata,
 			Destination: *destination,
+			Credentials: proc.config.credentialsMap[commonMetaData.WorkspaceID],
 		}
 		eventsToTransform = append(eventsToTransform, updatedEvent)
 	}
@@ -1605,6 +1629,11 @@ func (proc *Handle) processJobsForDest(partition string, subJobs subJob) *transf
 		requestIP := gatewayBatchEvent.RequestIP
 		receivedAt := gatewayBatchEvent.ReceivedAt
 
+		proc.statsFactory.NewSampledTaggedStat("processor.event_pickup_lag_seconds", stats.TimerType, stats.Tags{
+			"sourceId":    sourceID,
+			"workspaceId": batchEvent.WorkspaceId,
+		}).Since(receivedAt)
+
 		newStatus := jobsdb.JobStatusT{
 			JobID:         batchEvent.JobID,
 			JobState:      jobsdb.Succeeded.State,
@@ -1635,7 +1664,7 @@ func (proc *Handle) processJobsForDest(partition string, subJobs subJob) *transf
 
 		// Iterate through all the events in the batch
 		for _, singularEvent := range gatewayBatchEvent.Batch {
-			messageId := misc.GetStringifiedData(singularEvent["messageId"])
+			messageId := stringify.Any(singularEvent["messageId"])
 
 			payloadFunc := ro.Memoize(func() json.RawMessage {
 				payloadBytes, err := jsonfast.Marshal(singularEvent)
@@ -1666,7 +1695,7 @@ func (proc *Handle) processJobsForDest(partition string, subJobs subJob) *transf
 				ReceivedAt:    receivedAt,
 			}
 
-			commonMetadataFromSingularEvent := makeCommonMetadataFromSingularEvent(
+			commonMetadataFromSingularEvent := proc.makeCommonMetadataFromSingularEvent(
 				singularEvent,
 				batchEvent,
 				receivedAt,
@@ -1939,11 +1968,13 @@ func (proc *Handle) processJobsForDest(partition string, subJobs subJob) *transf
 
 					// At the TP flow we are not having destination information, so adding it here.
 					shallowEventCopy.Metadata.DestinationID = destination.ID
+					shallowEventCopy.Metadata.DestinationName = destination.Name
 					shallowEventCopy.Metadata.DestinationType = destination.DestinationDefinition.Name
 					if len(destination.Transformations) > 0 {
 						shallowEventCopy.Metadata.TransformationID = destination.Transformations[0].ID
 						shallowEventCopy.Metadata.TransformationVersionID = destination.Transformations[0].VersionID
 					}
+					shallowEventCopy.Credentials = proc.config.credentialsMap[destination.WorkspaceID]
 					filterConfig(&shallowEventCopy)
 					metadata := shallowEventCopy.Metadata
 					srcAndDestKey := getKeyFromSourceAndDest(metadata.SourceID, metadata.DestinationID)
@@ -2413,8 +2444,8 @@ func (proc *Handle) transformSrcDest(
 		SourceType:           eventList[0].Metadata.SourceType,
 		SourceCategory:       eventList[0].Metadata.SourceCategory,
 		WorkspaceID:          workspaceID,
-		Namespace:            config.GetKubeNamespace(),
-		InstanceID:           misc.GetInstanceID(),
+		Namespace:            proc.namespace,
+		InstanceID:           proc.instanceID,
 		DestinationID:        destID,
 		DestinationType:      destType,
 		SourceDefinitionType: eventList[0].Metadata.SourceDefinitionType,
@@ -3175,20 +3206,23 @@ func (proc *Handle) countPendingEvents(ctx context.Context) error {
 	jobdDBQueryRequestTimeout := config.GetDurationVar(600, time.Second, "JobsDB.GetPileUpCounts.QueryRequestTimeout", "JobsDB.QueryRequestTimeout")
 	jobdDBMaxRetries := config.GetReloadableIntVar(2, 1, "JobsDB.Processor.MaxRetries", "JobsDB.MaxRetries")
 
-	for tablePrefix, db := range dbs {
-		pileUpStatMap, err := misc.QueryWithRetriesAndNotify(ctx,
-			jobdDBQueryRequestTimeout,
-			jobdDBMaxRetries.Load(),
-			func(ctx context.Context) (map[string]map[string]int, error) {
-				return db.GetPileUpCounts(ctx)
-			}, func(attempt int) {
-				proc.logger.Warnf("Timeout during GetPileUpCounts, attempt %d", attempt)
-				stats.Default.NewTaggedStat("jobsdb_query_timeout", stats.CountType, stats.Tags{"attempt": fmt.Sprint(attempt), "module": "pileup"}).Count(1)
-			})
-		if err != nil {
-			return err
-		}
-		proc.IncreasePendingEvents(tablePrefix, pileUpStatMap)
-	}
-	return nil
+	return misc.RetryWithNotify(ctx,
+		jobdDBQueryRequestTimeout,
+		jobdDBMaxRetries.Load(),
+		func(ctx context.Context) error {
+			metric.Instance.Reset()
+			g, ctx := errgroup.WithContext(ctx)
+			for tablePrefix, db := range dbs {
+				g.Go(func() error {
+					if err := db.GetPileUpCounts(ctx); err != nil {
+						return fmt.Errorf("pileup counts for %s: %w", tablePrefix, err)
+					}
+					return nil
+				})
+			}
+			return g.Wait()
+		}, func(attempt int) {
+			proc.logger.Warnf("Timeout during GetPileUpCounts, attempt %d", attempt)
+			stats.Default.NewTaggedStat("jobsdb_query_timeout", stats.CountType, stats.Tags{"attempt": strconv.Itoa(attempt), "module": "pileup"}).Increment()
+		})
 }

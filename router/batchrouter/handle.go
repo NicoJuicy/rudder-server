@@ -27,9 +27,10 @@ import (
 	"github.com/rudderlabs/rudder-go-kit/logger"
 	"github.com/rudderlabs/rudder-go-kit/stats"
 	kitsync "github.com/rudderlabs/rudder-go-kit/sync"
+	obskit "github.com/rudderlabs/rudder-observability-kit/go/labels"
 	backendconfig "github.com/rudderlabs/rudder-server/backend-config"
 	"github.com/rudderlabs/rudder-server/jobsdb"
-	"github.com/rudderlabs/rudder-server/router/batchrouter/asyncdestinationmanager/common"
+	asynccommon "github.com/rudderlabs/rudder-server/router/batchrouter/asyncdestinationmanager/common"
 	"github.com/rudderlabs/rudder-server/router/batchrouter/isolation"
 	"github.com/rudderlabs/rudder-server/router/rterror"
 	routerutils "github.com/rudderlabs/rudder-server/router/utils"
@@ -51,6 +52,7 @@ type Handle struct {
 	destType string
 	// dependencies
 
+	conf               *config.Config
 	logger             logger.Logger
 	netHandle          *http.Client
 	jobsDB             jobsdb.JobsDB
@@ -65,31 +67,32 @@ type Handle struct {
 	Diagnostics        diagnostics.DiagnosticsI
 	adaptiveLimit      func(int64) int64
 	isolationStrategy  isolation.Strategy
+	now                func() time.Time
 
 	// configuration
 
 	maxEventsInABatch            int
 	maxPayloadSizeInBytes        int
-	maxFailedCountForJob         misc.ValueLoader[int]
-	maxFailedCountForSourcesJob  misc.ValueLoader[int]
-	asyncUploadTimeout           misc.ValueLoader[time.Duration]
-	retryTimeWindow              misc.ValueLoader[time.Duration]
-	sourcesRetryTimeWindow       misc.ValueLoader[time.Duration]
+	maxFailedCountForJob         config.ValueLoader[int]
+	maxFailedCountForSourcesJob  config.ValueLoader[int]
+	asyncUploadTimeout           config.ValueLoader[time.Duration]
+	retryTimeWindow              config.ValueLoader[time.Duration]
+	sourcesRetryTimeWindow       config.ValueLoader[time.Duration]
 	reportingEnabled             bool
-	jobQueryBatchSize            misc.ValueLoader[int]
-	pollStatusLoopSleep          misc.ValueLoader[time.Duration]
-	payloadLimit                 misc.ValueLoader[int64]
-	jobsDBCommandTimeout         misc.ValueLoader[time.Duration]
-	jobdDBQueryRequestTimeout    misc.ValueLoader[time.Duration]
-	jobdDBMaxRetries             misc.ValueLoader[int]
-	minIdleSleep                 misc.ValueLoader[time.Duration]
-	uploadFreq                   misc.ValueLoader[time.Duration]
-	mainLoopFreq                 misc.ValueLoader[time.Duration]
+	jobQueryBatchSize            config.ValueLoader[int]
+	pollStatusLoopSleep          config.ValueLoader[time.Duration]
+	payloadLimit                 config.ValueLoader[int64]
+	jobsDBCommandTimeout         config.ValueLoader[time.Duration]
+	jobdDBQueryRequestTimeout    config.ValueLoader[time.Duration]
+	jobdDBMaxRetries             config.ValueLoader[int]
+	minIdleSleep                 config.ValueLoader[time.Duration]
+	uploadFreq                   config.ValueLoader[time.Duration]
+	mainLoopFreq                 config.ValueLoader[time.Duration]
 	disableEgress                bool
-	warehouseServiceMaxRetryTime misc.ValueLoader[time.Duration]
+	warehouseServiceMaxRetryTime config.ValueLoader[time.Duration]
 	transformerURL               string
-	datePrefixOverride           misc.ValueLoader[string]
-	customDatePrefix             misc.ValueLoader[string]
+	datePrefixOverride           config.ValueLoader[string]
+	customDatePrefix             config.ValueLoader[string]
 
 	drainer routerutils.Drainer
 
@@ -133,7 +136,7 @@ type Handle struct {
 
 	diagnosisTicker          *time.Ticker
 	uploadedRawDataJobsCache map[string]map[string]bool
-	asyncDestinationStruct   map[string]*common.AsyncDestinationStruct
+	asyncDestinationStruct   map[string]*asynccommon.AsyncDestinationStruct
 
 	asyncPollTimeStat       stats.Measurement
 	asyncFailedJobsTimeStat stats.Measurement
@@ -144,6 +147,10 @@ type Handle struct {
 
 // mainLoop is responsible for pinging the workers periodically for every active partition
 func (brt *Handle) mainLoop(ctx context.Context) {
+	if brt.now == nil {
+		brt.now = time.Now
+	}
+
 	pool := workerpool.New(ctx, func(partition string) workerpool.Worker { return newWorker(partition, brt.logger, brt) }, brt.logger)
 	defer pool.Shutdown()
 	mainLoopSleep := time.Duration(0)
@@ -394,13 +401,31 @@ func (brt *Handle) upload(provider string, batchJobs *BatchedJobs, isWarehouse b
 		datePrefixLayout = dateFormat
 	}
 
+	workspaceID := batchJobs.Connection.Destination.WorkspaceID
+	customTimezone := brt.conf.GetString("BatchRouter.customTimezone."+workspaceID, "")
+
+	now := brt.now()
+	if customTimezone != "" {
+		loc, err := time.LoadLocation(customTimezone)
+		if err != nil {
+			brt.logger.Errorn(
+				"Error loading custom timezone",
+				obskit.Error(err),
+				obskit.WorkspaceID(workspaceID),
+				logger.NewStringField("customTimezone", customTimezone),
+			)
+		}
+		now = now.In(loc)
+	}
+
 	brt.logger.Debugf("BRT: Date prefix layout is %s", datePrefixLayout)
 	switch datePrefixLayout {
 	case "MM-DD-YYYY": // used to be earlier default
-		datePrefixLayout = time.Now().Format("01-02-2006")
+		datePrefixLayout = now.Format("01-02-2006")
 	default:
-		datePrefixLayout = time.Now().Format("2006-01-02")
+		datePrefixLayout = now.Format("2006-01-02")
 	}
+
 	keyPrefixes := []string{folderName, batchJobs.Connection.Source.ID, brt.customDatePrefix.Load() + datePrefixLayout}
 
 	_, fileName := filepath.Split(gzipFilePath)
@@ -543,7 +568,11 @@ func (brt *Handle) updateJobStatus(batchJobs *BatchedJobs, isWarehouse bool, err
 			errorResp = []byte(fmt.Sprintf(`{"reason":"%s"}`, errOccurred.Error())) // skipcq: GO-R4002
 		default:
 			brt.logger.Errorf("BRT: Error uploading to object storage: %v %v", errOccurred, batchJobs.Connection.Source.ID)
-			batchJobState = jobsdb.Failed.State
+			if batchJobs.JobState != "" {
+				batchJobState = batchJobs.JobState
+			} else {
+				batchJobState = jobsdb.Failed.State
+			}
 			errorResp, _ = json.Marshal(ErrorResponse{Error: errOccurred.Error()})
 			batchReqMetric.batchRequestFailed = 1
 			// We keep track of number of failed attempts in case of failure and number of events uploaded in case of success in stats
@@ -796,7 +825,7 @@ func (brt *Handle) uploadInterval(destinationConfig map[string]interface{}) time
 
 // skipFetchingJobs returns true if the destination type is async and the there are still jobs in [importing] state for this destination type
 func (brt *Handle) skipFetchingJobs(partition string) bool {
-	if slices.Contains(asyncDestinations, brt.destType) {
+	if asynccommon.IsAsyncDestination(brt.destType) {
 		queryParams := jobsdb.GetQueryParams{
 			CustomValFilters: []string{brt.destType},
 			JobsLimit:        1,
