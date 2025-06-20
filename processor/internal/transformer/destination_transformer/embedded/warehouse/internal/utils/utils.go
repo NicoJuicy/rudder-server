@@ -2,8 +2,11 @@ package utils
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
+	"math/big"
 	"regexp"
+	"strconv"
 	"strings"
 	"time"
 	"unicode/utf16"
@@ -12,6 +15,7 @@ import (
 	"github.com/samber/lo"
 
 	"github.com/rudderlabs/rudder-go-kit/jsonrs"
+
 	"github.com/rudderlabs/rudder-server/processor/internal/transformer/destination_transformer/embedded/warehouse/internal/model"
 	"github.com/rudderlabs/rudder-server/processor/types"
 	"github.com/rudderlabs/rudder-server/utils/misc"
@@ -49,6 +53,8 @@ var (
 
 	minTimeInMs = time.Date(1, 1, 1, 0, 0, 0, 0, time.UTC)
 	maxTimeInMs = time.Date(9999, 12, 31, 23, 59, 59, 999000000, time.UTC)
+
+	jsonrsStd = jsonrs.NewWithLibrary(jsonrs.StdLib)
 )
 
 func init() {
@@ -144,8 +150,29 @@ func ToTimestamp(val any) any {
 	return val
 }
 
+// parseTimestamp parses a timestamp string into time.Time.
+// If it fails due to a "day out of range" error, it falls back to normalizing the date.
+// JS automatically handles this https://www.programiz.com/online-compiler/4gfcMEByAur4q
+// console.log(new Date('1988-04-31').toISOString()); // 1988-05-01T00:00:00.000Z
 func parseTimestamp(input string) (time.Time, error) {
-	return dateparse.ParseAny(input)
+	t, err := dateparse.ParseAny(input)
+	if err == nil {
+		return t, nil
+	}
+	var pe *time.ParseError
+	ok := errors.As(err, &pe)
+	if !ok {
+		return time.Time{}, err
+	}
+	if pe.Message == ": day out of range" {
+		var year, month, day int
+
+		if n, _ := fmt.Sscanf(input, "%d-%d-%d", &year, &month, &day); n == 3 {
+			t = time.Date(year, time.Month(month), day, 0, 0, 0, 0, time.UTC)
+			return t, nil
+		}
+	}
+	return time.Time{}, err
 }
 
 // ToString converts any value to a string representation.
@@ -159,6 +186,11 @@ func ToString(value interface{}) string {
 	switch v := value.(type) {
 	case string:
 		return v
+	case float64:
+		if big.NewFloat(v).IsInt() {
+			return strconv.FormatFloat(v, 'f', -1, 64)
+		}
+		return fmt.Sprintf("%v", value)
 	case fmt.Stringer:
 		return v.String()
 	default:
@@ -246,7 +278,7 @@ func ExtractReceivedAt(event *types.TransformerEvent, now func() time.Time) stri
 func MarshalJSON(input any) ([]byte, error) {
 	var buf bytes.Buffer
 
-	enc := jsonrs.NewEncoder(&buf)
+	enc := jsonrsStd.NewEncoder(&buf)
 	enc.SetEscapeHTML(false)
 
 	if err := enc.Encode(input); err != nil {

@@ -1,3 +1,4 @@
+//go:generate mockgen -destination=mocks/upload.go -package=mocks -source=upload.go loadFilesRepo,stagingFilesRepo
 package router
 
 import (
@@ -12,6 +13,7 @@ import (
 
 	"github.com/cenkalti/backoff/v4"
 	"github.com/samber/lo"
+	"golang.org/x/sync/errgroup"
 
 	"github.com/rudderlabs/rudder-go-kit/config"
 	"github.com/rudderlabs/rudder-go-kit/filemanager"
@@ -19,6 +21,7 @@ import (
 	"github.com/rudderlabs/rudder-go-kit/stats"
 
 	"github.com/rudderlabs/rudder-go-kit/jsonrs"
+
 	"github.com/rudderlabs/rudder-server/jobsdb"
 	"github.com/rudderlabs/rudder-server/rruntime"
 	"github.com/rudderlabs/rudder-server/services/alerta"
@@ -61,6 +64,19 @@ type UploadJobFactory struct {
 	encodingFactory      *encoding.Factory
 }
 
+type loadFilesRepo interface {
+	Get(ctx context.Context, uploadID int64, stagingFileIDs []int64) ([]model.LoadFile, error)
+	Delete(ctx context.Context, uploadID int64, stagingFileIDs []int64) error
+	TotalExportedEvents(ctx context.Context, uploadID int64, stagingFileIDs []int64, skipTables []string) (int64, error)
+	GetByID(ctx context.Context, id int64) (*model.LoadFile, error)
+	DistinctTableName(ctx context.Context, sourceID, destinationID string, startID, endID int64) ([]string, error)
+}
+
+type stagingFilesRepo interface {
+	TotalEventsForUploadID(ctx context.Context, uploadID int64) (int64, error)
+	GetEventTimeRangesByUploadID(ctx context.Context, uploadID int64) ([]model.EventTimeRange, error)
+}
+
 type UploadJob struct {
 	ctx                  context.Context
 	db                   *sqlquerywrapper.DB
@@ -69,8 +85,8 @@ type UploadJob struct {
 	loadfile             *loadfiles.LoadFileGenerator
 	tableUploadsRepo     *repo.TableUploads
 	uploadsRepo          *repo.Uploads
-	stagingFileRepo      *repo.StagingFiles
-	loadFilesRepo        *repo.LoadFiles
+	stagingFileRepo      stagingFilesRepo
+	loadFilesRepo        loadFilesRepo
 	whSchemaRepo         *repo.WHSchema
 	whManager            manager.Manager
 	schemaHandle         schema.Handler
@@ -104,25 +120,31 @@ type UploadJob struct {
 		longRunningUploadStatThresholdInMin time.Duration
 		skipPreviouslyFailedTables          bool
 		queryLoadFilesWithUploadID          config.ValueLoader[bool]
+		// max number of parallel delete requests to filemanager (applies to GCS only)
+		maxConcurrentObjDeleteRequests func(workspaceID string) int
+		// batch size for parallel deletion of staging and loadfiles (applies to GCS only)
+		objDeleteBatchSize func(workspaceID string) int
 	}
 
-	errorHandler    ErrorHandler
-	encodingFactory *encoding.Factory
+	errorHandler       ErrorHandler
+	encodingFactory    *encoding.Factory
+	fileManagerFactory filemanager.Factory
 
 	stats struct {
-		uploadTime                         stats.Measurement
-		userTablesLoadTime                 stats.Measurement
-		identityTablesLoadTime             stats.Measurement
-		otherTablesLoadTime                stats.Measurement
-		loadFileGenerationTime             stats.Measurement
-		tablesAdded                        stats.Measurement
-		columnsAdded                       stats.Measurement
-		uploadFailed                       stats.Measurement
-		totalRowsSynced                    stats.Measurement
-		numStagedEvents                    stats.Measurement
-		uploadSuccess                      stats.Measurement
-		stagingLoadFileEventsCountMismatch stats.Measurement
+		uploadTime                         stats.Timer
+		userTablesLoadTime                 stats.Timer
+		identityTablesLoadTime             stats.Timer
+		otherTablesLoadTime                stats.Timer
+		loadFileGenerationTime             stats.Timer
+		uploadFailed                       stats.Counter
+		totalRowsSynced                    stats.Counter
+		numStagedEvents                    stats.Counter
+		uploadSuccess                      stats.Counter
+		stagingLoadFileEventsCountMismatch stats.Gauge
 		eventDeliveryTime                  stats.Timer
+		objectsDeleted                     stats.Gauge
+		objectsDeletionTime                stats.Timer
+		consolidatedSchemaSize             stats.Histogram
 	}
 }
 
@@ -181,8 +203,9 @@ func (f *UploadJobFactory) NewUploadJob(ctx context.Context, dto *model.UploadJo
 		),
 		now: timeutil.Now,
 
-		errorHandler:    ErrorHandler{Mapper: whManager},
-		encodingFactory: f.encodingFactory,
+		errorHandler:       ErrorHandler{Mapper: whManager},
+		encodingFactory:    f.encodingFactory,
+		fileManagerFactory: filemanager.New,
 	}
 
 	uj.config.refreshPartitionBatchSize = f.conf.GetInt("Warehouse.refreshPartitionBatchSize", 100)
@@ -198,14 +221,24 @@ func (f *UploadJobFactory) NewUploadJob(ctx context.Context, dto *model.UploadJo
 	uj.config.retryTimeWindow = f.conf.GetDurationVar(180, time.Minute, "Warehouse.retryTimeWindow", "Warehouse.retryTimeWindowInMins")
 	uj.config.skipPreviouslyFailedTables = f.conf.GetBool("Warehouse.skipPreviouslyFailedTables", false)
 	uj.config.queryLoadFilesWithUploadID = f.conf.GetReloadableBoolVar(false, "Warehouse.loadFiles.queryWithUploadID.enable")
+	uj.config.maxConcurrentObjDeleteRequests = func(workspaceID string) int {
+		return f.conf.GetIntVar(10, 1,
+			fmt.Sprintf("Warehouse.filemanager.%s.GCS.maxConcurrentObjDeleteRequests", workspaceID),
+			"Warehouse.filemanager.maxConcurrentObjDeleteRequests",
+		)
+	}
+	uj.config.objDeleteBatchSize = func(workspaceID string) int {
+		return f.conf.GetIntVar(1000, 1,
+			fmt.Sprintf("Warehouse.filemanager.%s.GCS.fileDeleteBatchSize", workspaceID),
+			"Warehouse.filemanager.GCS.fileDeleteBatchSize",
+		)
+	}
 
 	uj.stats.uploadTime = uj.timerStat("upload_time")
 	uj.stats.userTablesLoadTime = uj.timerStat("user_tables_load_time")
 	uj.stats.identityTablesLoadTime = uj.timerStat("identity_tables_load_time")
 	uj.stats.otherTablesLoadTime = uj.timerStat("other_tables_load_time")
 	uj.stats.loadFileGenerationTime = uj.timerStat("load_file_generation_time")
-	uj.stats.tablesAdded = uj.counterStat("tables_added")
-	uj.stats.columnsAdded = uj.counterStat("columns_added")
 	uj.stats.uploadFailed = uj.counterStat("warehouse_failed_uploads")
 	uj.stats.totalRowsSynced = uj.counterStat("total_rows_synced")
 	uj.stats.numStagedEvents = uj.counterStat("num_staged_events")
@@ -214,6 +247,7 @@ func (f *UploadJobFactory) NewUploadJob(ctx context.Context, dto *model.UploadJo
 		"warehouse_staging_load_file_events_count_mismatched",
 		whutils.Tag{Name: "sourceCategory", Value: uj.warehouse.Source.SourceDefinition.Category},
 	)
+	uj.stats.consolidatedSchemaSize = uj.histogramStat("warehouse_consolidated_schema_size")
 
 	syncFrequency := "1440" // 24h
 	if frequency := uj.warehouse.GetStringDestinationConfig(uj.conf, model.SyncFrequencySetting); frequency != "" {
@@ -224,6 +258,9 @@ func (f *UploadJobFactory) NewUploadJob(ctx context.Context, dto *model.UploadJo
 		whutils.Tag{Name: "sourceCategory", Value: uj.warehouse.Source.SourceDefinition.Category},
 	)
 
+	storageProvider := whutils.ObjectStorageType(uj.warehouse.Destination.DestinationDefinition.Name, uj.warehouse.Destination.Config, uj.upload.UseRudderStorage)
+	uj.stats.objectsDeleted = uj.gaugeStat("objects_deleted_count", whutils.Tag{Name: "object_storage_type", Value: storageProvider})
+	uj.stats.objectsDeletionTime = uj.timerStat("objects_deletion_time", whutils.Tag{Name: "object_storage_type", Value: storageProvider})
 	return uj
 }
 
@@ -443,7 +480,8 @@ func (job *UploadJob) cleanupObjectStorageFiles() error {
 	}
 	destination := job.warehouse.Destination
 	storageProvider := whutils.ObjectStorageType(destination.DestinationDefinition.Name, destination.Config, job.upload.UseRudderStorage)
-	fm, err := filemanager.New(&filemanager.Settings{
+
+	fm, err := job.fileManagerFactory(&filemanager.Settings{
 		Provider: storageProvider,
 		Config: misc.GetObjectStorageConfig(misc.ObjectStorageOptsT{
 			Provider:         storageProvider,
@@ -456,6 +494,7 @@ func (job *UploadJob) cleanupObjectStorageFiles() error {
 	if err != nil {
 		return fmt.Errorf("creating file manager: %w", err)
 	}
+
 	loadingFiles, err := job.loadFilesRepo.Get(job.ctx, job.upload.ID, job.stagingFileIDs)
 	if err != nil {
 		return fmt.Errorf("fetching loading files: %w", err)
@@ -466,10 +505,44 @@ func (job *UploadJob) cleanupObjectStorageFiles() error {
 	loadingKeysToDel := lo.Map(loadingFiles, func(file model.LoadFile, _ int) string {
 		return fm.GetDownloadKeyFromFileLocation(file.Location)
 	})
-	if err = fm.Delete(job.ctx, append(stagingKeysToDel, loadingKeysToDel...)); err != nil {
+
+	filesToDel := append(stagingKeysToDel, loadingKeysToDel...)
+	concurrency := 1
+	chunkSize := len(filesToDel)
+
+	job.stats.objectsDeleted.Gauge(len(filesToDel))
+
+	// GCS doesn't support batch delete, so we need to delete files in chunks to speed up the deletion
+	if storageProvider == whutils.GCS {
+		concurrency = job.config.maxConcurrentObjDeleteRequests(job.upload.WorkspaceID)
+		chunkSize = job.config.objDeleteBatchSize(job.upload.WorkspaceID)
+	}
+
+	startTime := job.now()
+	err = job.deleteFilesInChunks(
+		filesToDel,
+		fm,
+		concurrency,
+		chunkSize,
+	)
+	if err != nil {
 		return fmt.Errorf("deleting files from object storage: %w", err)
 	}
+	job.stats.objectsDeletionTime.Since(startTime)
+
 	return nil
+}
+
+func (job *UploadJob) deleteFilesInChunks(keysToDel []string, fm filemanager.FileManager, concurrency, chunkSize int) error {
+	g, ctx := errgroup.WithContext(job.ctx)
+	g.SetLimit(concurrency)
+	chunks := lo.Chunk(keysToDel, chunkSize)
+	for _, chunk := range chunks {
+		g.Go(func() error {
+			return fm.Delete(ctx, chunk)
+		})
+	}
+	return g.Wait()
 }
 
 // CanAppend returns true if:
